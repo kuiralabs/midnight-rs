@@ -2357,6 +2357,73 @@ mod tests {
         }
     }
 
+    /// Regression (seed-at-rest): legacy metadata.json carrying a raw
+    /// `seed_hex` must still load, and the next save must upgrade the file to
+    /// the seedless format (digest only). Reproduces the real migration, not
+    /// just the happy path.
+    #[test]
+    fn legacy_seed_metadata_loads_and_upgrades_to_seedless() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(Some(dir.path().to_path_buf()));
+        wallet.save(dir.path()).unwrap();
+
+        // Locate the written metadata.json and rewrite it into the LEGACY
+        // format: raw seed_hex present, no digest — what old wallets have.
+        let meta_path = walkdir(dir.path()).expect("metadata.json written");
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        let obj = meta.as_object_mut().unwrap();
+        assert!(
+            obj.remove("seed_digest_hex").is_some(),
+            "current save must write the digest"
+        );
+        assert!(obj.get("seed_hex").is_none(), "current save must not write the seed");
+        obj.insert(
+            "seed_hex".into(),
+            serde_json::Value::String(hex::encode(wallet.seed.as_bytes())),
+        );
+        std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+        // Legacy file must load (compat branch)...
+        let loaded = crate::storage::load(dir.path(), &wallet.network_id, &wallet.seed)
+            .unwrap()
+            .expect("legacy metadata must load");
+        drop(loaded);
+
+        // ...a WRONG seed must still be rejected on the legacy branch...
+        let wrong = WalletSeed::from([9u8; 32]);
+        assert!(crate::storage::load(dir.path(), &wallet.network_id, &wrong)
+            .unwrap()
+            .is_none() // different seed → different dir → not found
+        );
+
+        // ...and the next save must upgrade the file: seed gone, digest back.
+        wallet.save(dir.path()).unwrap();
+        let upgraded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert!(upgraded.get("seed_hex").is_none(), "seed must not be re-persisted");
+        assert!(upgraded.get("seed_digest_hex").is_some(), "digest must be present");
+        let raw = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(
+            !raw.contains(&hex::encode(wallet.seed.as_bytes())),
+            "raw seed hex must not appear anywhere in metadata"
+        );
+    }
+
+    fn walkdir(base: &std::path::Path) -> Option<std::path::PathBuf> {
+        for e in std::fs::read_dir(base).ok()? {
+            let p = e.ok()?.path();
+            if p.is_dir() {
+                if let Some(f) = walkdir(&p) {
+                    return Some(f);
+                }
+            } else if p.file_name()? == "metadata.json" {
+                return Some(p);
+            }
+        }
+        None
+    }
+
     #[test]
     fn noop_resync_commit_skips_persistence() {
         // Seam for the resync commit path: resync runs before every build,

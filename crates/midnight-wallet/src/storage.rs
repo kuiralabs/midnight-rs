@@ -22,7 +22,15 @@ fn dust_wallet_file(generation: u64) -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredMetadata {
-    seed_hex: String,
+    /// Legacy field: raw seed hex. Never written anymore (secrets must not
+    /// rest on disk); still read so existing wallets load, and upgraded to
+    /// `seed_digest_hex` on the next save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seed_hex: Option<String>,
+    /// SHA-256 of the seed bytes, hex — identifies the wallet the snapshot
+    /// belongs to without storing the secret itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seed_digest_hex: Option<String>,
     /// Monotonically increasing version of the wallet snapshot. Each save
     /// writes new `zswap-{generation}.bin` / `dust_wallet-{generation}.bin`
     /// files and commits a new metadata.json referencing them, then deletes
@@ -149,12 +157,29 @@ pub(crate) fn load(
     let metadata: StoredMetadata = serde_json::from_str(&meta_json)
         .map_err(|e| WalletError::Storage(format!("parse metadata: {e}")))?;
 
-    let stored_seed = WalletSeed::try_from_hex_str(&metadata.seed_hex)
-        .map_err(|e| WalletError::Storage(format!("parse stored seed: {e}")))?;
-    if stored_seed != *seed {
-        return Err(WalletError::Storage(
-            "stored seed does not match requested seed".into(),
-        ));
+    use sha2::Digest as _;
+    let requested_digest = hex::encode(sha2::Sha256::digest(seed.as_bytes()));
+    match (&metadata.seed_digest_hex, &metadata.seed_hex) {
+        (Some(digest), _) => {
+            if *digest != requested_digest {
+                return Err(WalletError::Storage(
+                    "stored wallet does not match requested seed".into(),
+                ));
+            }
+        }
+        (None, Some(legacy_hex)) => {
+            let stored_seed = WalletSeed::try_from_hex_str(legacy_hex)
+                .map_err(|e| WalletError::Storage(format!("parse stored seed: {e}")))?;
+            if stored_seed != *seed {
+                return Err(WalletError::Storage(
+                    "stored seed does not match requested seed".into(),
+                ));
+            }
+        }
+        (None, None) => {
+            // Pre-digest metadata with no seed at all: the directory name is
+            // itself SHA-256(seed)-derived, which already routed us here.
+        }
     }
 
     let zswap_state = tagged_from_file(&dir, &zswap_file(metadata.generation))?;
@@ -217,7 +242,11 @@ pub(crate) fn save(
     tagged_to_file(&dir, &dust_wallet_file(generation), dust_wallet)?;
 
     let metadata = StoredMetadata {
-        seed_hex: hex::encode(seed.as_bytes()),
+        seed_hex: None,
+        seed_digest_hex: Some(hex::encode({
+            use sha2::Digest as _;
+            sha2::Sha256::digest(seed.as_bytes())
+        })),
         generation,
         zswap_event_id,
         dust_event_id,
@@ -322,7 +351,7 @@ pub(crate) fn load_pending(
     let stored: StoredPending = serde_json::from_str(&json)
         .map_err(|e| WalletError::Storage(format!("parse pending: {e}")))?;
 
-    let pending = PendingReservations::from_stored(stored)?;
+    let pending = PendingReservations::from_stored(stored, seed)?;
     info!(path = %path.display(), "loaded pending reservations");
     Ok(Some(pending))
 }

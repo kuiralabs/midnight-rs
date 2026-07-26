@@ -169,8 +169,11 @@ pub(crate) struct StoredPending {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct StoredPendingDustBatch {
-    /// Hex-encoded `WalletSeed::as_bytes()` (32 bytes).
-    pub seed_hex: String,
+    /// Legacy field: raw seed hex. Never written anymore (pending.json lives
+    /// in the per-wallet storage dir, so the wallet's seed is injected at
+    /// load); still accepted so existing files parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_hex: Option<String>,
     /// Tagged-serialized `Vec<DustSpend<ProofPreimageMarker, DefaultDB>>`, hex.
     pub spends_hex: String,
     /// Tagged-serialized `Sp<DustLocalState<DefaultDB>, DefaultDB>`, hex.
@@ -197,7 +200,7 @@ impl PendingReservations {
             tagged_serialize(&p.updated_state, &mut state_buf)
                 .map_err(|e| WalletError::Storage(format!("serialize pending dust state: {e}")))?;
             dust.push(StoredPendingDustBatch {
-                seed_hex: hex::encode(p.seed.as_bytes()),
+                seed_hex: None,
                 spends_hex: hex::encode(&spends_buf),
                 updated_state_hex: hex::encode(&state_buf),
                 reserved_at_secs: p.reserved_at.to_secs(),
@@ -217,11 +220,25 @@ impl PendingReservations {
         Ok(StoredPending { dust, unshielded })
     }
 
-    pub(crate) fn from_stored(stored: StoredPending) -> Result<Self, WalletError> {
+    pub(crate) fn from_stored(
+        stored: StoredPending,
+        wallet_seed: &WalletSeed,
+    ) -> Result<Self, WalletError> {
         let mut dust = Vec::with_capacity(stored.dust.len());
         for s in stored.dust {
-            let seed = WalletSeed::try_from_hex_str(&s.seed_hex)
-                .map_err(|e| WalletError::Storage(format!("parse pending seed hex: {e}")))?;
+            // pending.json is scoped to one wallet's storage dir; the owning
+            // seed comes from the caller. A legacy stored seed, if present,
+            // must match — otherwise the file belongs to a different wallet.
+            if let Some(legacy_hex) = &s.seed_hex {
+                let legacy = WalletSeed::try_from_hex_str(legacy_hex)
+                    .map_err(|e| WalletError::Storage(format!("parse pending seed hex: {e}")))?;
+                if legacy != *wallet_seed {
+                    return Err(WalletError::Storage(
+                        "pending reservations belong to a different wallet".into(),
+                    ));
+                }
+            }
+            let seed = wallet_seed.clone();
             let spends_bytes = hex::decode(&s.spends_hex)
                 .map_err(|e| WalletError::Storage(format!("decode pending dust spends: {e}")))?;
             let spends: Vec<DustSpend<ProofPreimageMarker, DefaultDB>> =
