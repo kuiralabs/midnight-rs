@@ -611,6 +611,33 @@ impl MidnightProvider {
         Ok(result)
     }
 
+    /// Spike (#105): shield unshielded NIGHT into native shielded NIGHT held by
+    /// `recipient` (a shielded address). Builds + submits in one call.
+    pub async fn shield(
+        &self,
+        amount: u128,
+        recipient: &str,
+    ) -> Result<PendingTx, ProviderError> {
+        let result = self.build_shield(amount, recipient).await?;
+        self.submit(&result.tx_bytes).await
+    }
+
+    pub(crate) async fn build_shield(
+        &self,
+        amount: u128,
+        recipient: &str,
+    ) -> Result<TransferResult, ProviderError> {
+        let mut guard = self.open_transfer_guard().await?;
+        let transfer = TransferBuilder::new(
+            &guard.wallet,
+            guard.context.clone(),
+            guard.proof_provider.clone(),
+        );
+        let result = transfer.shield(amount, recipient).await?;
+        guard.reserve(&result);
+        Ok(result)
+    }
+
     /// Acquire a write lock + build a `LedgerContext` snapshot in one step,
     /// for the three transfer/registration build paths. Resyncs first so the
     /// proof root and TTL anchor match the chain's current view.

@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use midnight_helpers::{
     BuildUtxoOutput, BuildUtxoSpend, CoinSelectionStrategy, DefaultDB, DustActions, DustLocalState,
-    DustRegistrationBuilder, DustSpend, FromContext, HashMapStorage, InputInfo, Intent, IntentInfo,
+    DustRegistrationBuilder, DustSpend, FromContext, HashMapStorage, HashOutput, InputInfo, Intent,
+    IntentInfo,
     LedgerContext, NIGHT, OfferInfo, OutputInfo, PedersenRandomness, ProofPreimageMarker,
     ProofProvider, Segment, ShieldedTokenType, ShieldedWallet, Signature, Sp, SplittableRng,
     StandardTrasactionInfo, StdRng, Timestamp, TokenType, Transaction, UnshieldedOfferInfo,
@@ -106,6 +107,97 @@ impl<'a> TransferBuilder<'a> {
         tx_info.use_mock_proofs_for_fees(false);
 
         prove_and_serialize(tx_info).await
+    }
+
+    /// Build a **shield** transaction: convert unshielded (transparent) NIGHT
+    /// into native **shielded** NIGHT held by `recipient`.
+    ///
+    /// Spends the wallet's unshielded NIGHT UTXOs to cover `amount` (returning
+    /// change to the sender) and emits a shielded NIGHT output to the recipient
+    /// shielded address. The unshielded intent nets `+amount` (inputs exceed the
+    /// change output by `amount`); the guaranteed zswap offer carries a matching
+    /// shielded output whose value commitment nets `-amount`, so the transaction
+    /// balances across the transparent/shielded segments. This is the
+    /// native-token shield the higher-level SDKs expose as `initSwap`.
+    pub async fn shield(
+        self,
+        amount: u128,
+        recipient: &str,
+    ) -> Result<TransferResult, WalletError> {
+        let from_seed = self.state.seed().clone();
+        let recipient_wallet = parse_shielded_recipient(recipient)?;
+
+        // 1. Select unshielded NIGHT UTXOs to cover the amount (+ change).
+        let (spend_infos, change) = UtxoSpendInfo::utxos_to_cover_value(
+            self.context.clone(),
+            from_seed.clone(),
+            amount,
+            NIGHT,
+            CoinSelectionStrategy::default(),
+        )
+        .map_err(|e| WalletError::Transfer(format!("utxo selection: {e}")))?;
+
+        let spent_unshielded_inputs: Vec<SpentUtxoKey> = spend_infos
+            .iter()
+            .filter_map(|s| {
+                let intent_hash = s.intent_hash.as_ref()?;
+                let output_index = s.output_number?;
+                Some(SpentUtxoKey {
+                    intent_hash: hex::encode(intent_hash.0.0),
+                    output_index,
+                })
+            })
+            .collect();
+
+        // 2. Unshielded offer: spend NIGHT, return only change to self. The
+        //    `amount` beyond change leaves the transparent segment.
+        let mut outputs: Vec<Box<dyn BuildUtxoOutput<DefaultDB>>> = Vec::new();
+        if change > 0 {
+            outputs.push(Box::new(UtxoOutputInfo {
+                value: change,
+                owner: from_seed.clone(),
+                token_type: NIGHT,
+            }));
+        }
+        let unshielded_offer = UnshieldedOfferInfo {
+            inputs: spend_infos
+                .into_iter()
+                .map(|s| Box::new(s) as Box<dyn BuildUtxoSpend<DefaultDB>>)
+                .collect(),
+            outputs,
+        };
+        let intent_info: IntentInfo<DefaultDB> = IntentInfo {
+            guaranteed_unshielded_offer: Some(unshielded_offer),
+            fallible_unshielded_offer: None,
+            actions: vec![],
+        };
+
+        // 3. Guaranteed zswap offer: one shielded NIGHT output, no shielded
+        //    input → its value commitment nets `-amount`, matching the
+        //    transparent surplus above.
+        let shielded_night = ShieldedTokenType(HashOutput([0u8; 32]));
+        let output: OutputInfo<ShieldedWallet<DefaultDB>> = OutputInfo {
+            destination: recipient_wallet,
+            token_type: shielded_night,
+            value: amount,
+        };
+        let offer = OfferInfo {
+            inputs: vec![],
+            outputs: vec![Box::new(output)],
+            transients: vec![],
+        };
+
+        // 4. Combine into one transaction (segment 1 = guaranteed).
+        let mut tx_info =
+            StandardTrasactionInfo::new_from_context(self.context, self.proof_provider, None);
+        tx_info.add_intent(1, Box::new(intent_info));
+        tx_info.set_guaranteed_offer(offer);
+        tx_info.set_funding_seeds(vec![from_seed]);
+        tx_info.use_mock_proofs_for_fees(false);
+
+        let mut result = prove_and_serialize(tx_info).await?;
+        result.spent_unshielded_inputs = spent_unshielded_inputs;
+        Ok(result)
     }
 
     /// Build an unshielded (UTXO) transfer transaction.
