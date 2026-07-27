@@ -42,8 +42,6 @@ use crate::transfer::{DustSpendBatch, SpentUtxoKey};
 /// `spent_utxos` and rolls `dust_local_state` forward.
 #[derive(Clone)]
 pub(crate) struct PendingDustBatch {
-    /// The funding wallet seed this batch came from.
-    pub seed: WalletSeed,
     /// The spends as built. Tagged-serializable so they can be persisted.
     pub spends: Vec<DustSpend<ProofPreimageMarker, DefaultDB>>,
     /// `DustLocalState` after these spends were applied to the wallet's
@@ -78,7 +76,6 @@ impl PendingReservations {
     ) {
         self.dust
             .extend(dust_batches.into_iter().map(|b| PendingDustBatch {
-                seed: b.seed,
                 spends: b.spends,
                 updated_state: b.updated_state,
                 reserved_at,
@@ -238,7 +235,6 @@ impl PendingReservations {
                     ));
                 }
             }
-            let seed = wallet_seed.clone();
             let spends_bytes = hex::decode(&s.spends_hex)
                 .map_err(|e| WalletError::Storage(format!("decode pending dust spends: {e}")))?;
             let spends: Vec<DustSpend<ProofPreimageMarker, DefaultDB>> =
@@ -252,7 +248,6 @@ impl PendingReservations {
                     WalletError::Storage(format!("deserialize pending dust state: {e}"))
                 })?;
             dust.push(PendingDustBatch {
-                seed,
                 spends,
                 updated_state,
                 reserved_at: Timestamp::from_secs(s.reserved_at_secs),
