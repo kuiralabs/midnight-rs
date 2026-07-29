@@ -295,6 +295,14 @@ impl MidnightProvider {
         self
     }
 
+    /// Convenience: use a remote proof server at `url` for proving. Equivalent
+    /// to `with_proof_provider(Arc::new(RemoteProofServer::new(url)))`, but
+    /// keeps the `dyn ProofProvider` coercion inside this crate so callers
+    /// (e.g. FFI bindings) never name the ledger DB type.
+    pub fn with_remote_proof_server(self, url: impl Into<String>) -> Self {
+        self.with_proof_provider(Arc::new(crate::RemoteProofServer::new(url.into())))
+    }
+
     /// The proof backend used to prove transactions built through this
     /// provider (transfers, dust registration, and every contract deploy /
     /// call / maintenance op driven by a `Contract` built on it).
