@@ -323,21 +323,17 @@ impl DustlessTransaction {
 /// the `.await` vs `.build()` distinction.
 pub struct DustRegistration<'a> {
     provider: &'a MidnightProvider,
-    utxo_ctime: Option<u64>,
 }
 
 impl<'a> DustRegistration<'a> {
-    pub(crate) fn new(provider: &'a MidnightProvider, utxo_ctime: Option<u64>) -> Self {
-        Self {
-            provider,
-            utxo_ctime,
-        }
+    pub(crate) fn new(provider: &'a MidnightProvider) -> Self {
+        Self { provider }
     }
 
     /// Build the registration transaction without submitting. Spends and
-    /// re-creates the wallet's tNIGHT UTXOs as part of the build.
+    /// re-creates the selected tNIGHT UTXO as part of the build.
     pub async fn build(self) -> Result<TransferResult, ProviderError> {
-        self.provider.build_register_dust(self.utxo_ctime).await
+        self.provider.build_register_dust().await
     }
 }
 

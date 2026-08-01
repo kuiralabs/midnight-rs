@@ -617,8 +617,8 @@ impl MidnightProvider {
     /// Build a dust-address registration transaction. See
     /// [`Self::transfer_shielded`] for lock + reservation semantics and the
     /// `.await` vs `.build()` distinction.
-    pub fn register_dust(&self, utxo_ctime: Option<u64>) -> DustRegistration<'_> {
-        DustRegistration::new(self, utxo_ctime)
+    pub fn register_dust(&self) -> DustRegistration<'_> {
+        DustRegistration::new(self)
     }
 
     // -- Internal build paths driven by the transfer/register builders. --
@@ -698,17 +698,14 @@ impl MidnightProvider {
         Ok(result)
     }
 
-    pub(crate) async fn build_register_dust(
-        &self,
-        utxo_ctime: Option<u64>,
-    ) -> Result<TransferResult, ProviderError> {
+    pub(crate) async fn build_register_dust(&self) -> Result<TransferResult, ProviderError> {
         let mut guard = self.open_transfer_guard().await?;
         let transfer = TransferBuilder::new(
             &guard.wallet,
             guard.context.clone(),
             guard.proof_provider.clone(),
         );
-        let result = transfer.register_dust(utxo_ctime).await?;
+        let result = transfer.register_dust().await?;
         guard.reserve(&result);
         Ok(result)
     }

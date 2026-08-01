@@ -59,6 +59,12 @@ pub struct TrackedUtxo {
     pub value: u128,
     pub intent_hash: Option<String>,
     pub output_index: Option<i64>,
+    /// Creation time in SECONDS (indexer schema). `None` for coins synced before
+    /// this field was tracked; dust registration falls back to a conservative
+    /// estimate in that case.
+    pub ctime: Option<i64>,
+    /// Whether this UTXO already generates dust (skip it when selecting one to register).
+    pub registered_for_dust_generation: Option<bool>,
 }
 
 impl TryFrom<midnight_indexer_client::UnshieldedUtxo> for TrackedUtxo {
@@ -74,6 +80,8 @@ impl TryFrom<midnight_indexer_client::UnshieldedUtxo> for TrackedUtxo {
             value,
             intent_hash: utxo.intent_hash,
             output_index: utxo.output_index,
+            ctime: utxo.ctime,
+            registered_for_dust_generation: utxo.registered_for_dust_generation,
         })
     }
 }
@@ -206,6 +214,14 @@ pub(crate) struct SubscriptionUtxo {
     pub intent_hash: Option<String>,
     #[serde(default)]
     pub output_index: Option<i64>,
+    /// Creation time in SECONDS (per the indexer schema). Drives dust-registration
+    /// coin selection — the coin's real age determines its generationless dust.
+    #[serde(default)]
+    pub ctime: Option<i64>,
+    /// Whether this UTXO is already generating dust; used to skip already-registered
+    /// coins when selecting one to register.
+    #[serde(default)]
+    pub registered_for_dust_generation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2017,6 +2033,8 @@ fn parse_utxo(u: &SubscriptionUtxo) -> Result<TrackedUtxo, WalletError> {
         value,
         intent_hash: u.intent_hash.clone(),
         output_index: u.output_index,
+        ctime: u.ctime,
+        registered_for_dust_generation: u.registered_for_dust_generation,
     })
 }
 
@@ -2202,6 +2220,8 @@ mod tests {
             value: "1".into(),
             intent_hash: intent_hash.map(str::to_string),
             output_index,
+            ctime: None,
+            registered_for_dust_generation: None,
         }
     }
 
@@ -2758,6 +2778,8 @@ mod tests {
             value: 1,
             intent_hash: Some("aaaa".into()),
             output_index: Some(0),
+            ctime: None,
+            registered_for_dust_generation: None,
         };
         let mut utxos = vec![tracked];
 

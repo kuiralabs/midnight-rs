@@ -16,7 +16,7 @@ use midnight_helpers::{
 
 use crate::WalletError;
 use crate::network::Network;
-use crate::state::Wallet;
+use crate::state::{TrackedUtxo, Wallet};
 
 type UnprovenTx = Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>;
 type FinalizedTx = midnight_helpers::FinalizedTransaction<DefaultDB>;
@@ -396,37 +396,62 @@ impl<'a> TransferBuilder<'a> {
 
     /// Build a dust address registration transaction.
     ///
-    /// Spends and re-creates the wallet's tNIGHT UTXOs while registering
+    /// Spends and re-creates one of the wallet's tNIGHT UTXOs while registering
     /// the dust address. Uses "generationless fee availability" (virtual dust
     /// accrued by holding tNIGHT) to self-fund the registration fee.
     ///
-    /// `utxo_ctime` is the creation timestamp (seconds since epoch) of the
-    /// wallet's tNIGHT UTXOs. If `None`, uses `now - 1 hour` as a
-    /// conservative estimate.
-    pub async fn register_dust(
-        self,
-        utxo_ctime: Option<u64>,
-    ) -> Result<TransferResult, WalletError> {
+    /// The coin to register is chosen from each UTXO's own real creation time
+    /// (`ctime`, tracked from the indexer), so the fee it claims is exactly what
+    /// the node will credit — no caller-supplied estimate.
+    pub async fn register_dust(self) -> Result<TransferResult, WalletError> {
         let seed = self.state.seed().clone();
         let night_hex = "0".repeat(64);
 
-        // Register only the single highest-value NIGHT UTXO. It carries the most
-        // generationless dust to self-fund the registration fee, and a one-input
-        // registration keeps the fee minimal and avoids the ledger's multi-input
-        // time-to-dismiss rejection (error 168). Callers wanting every coin generating
-        // dust re-invoke until none remain unregistered (mirrors the Android SDK).
+        let now = self.context.latest_block_context().tblock;
+        let (night_dust_ratio, generation_decay_rate) = {
+            let d = &self.state.parameters().dust;
+            (d.night_dust_ratio, d.generation_decay_rate)
+        };
+
+        // Each coin's real creation time (SECONDS, per the indexer schema). A coin
+        // synced before `ctime` was tracked falls back to a conservative `now - 1h`.
+        let coin_ctime = |u: &TrackedUtxo| -> Timestamp {
+            match u.ctime {
+                Some(secs) if secs >= 0 => Timestamp::from_secs(secs as u64),
+                _ => Timestamp::from_secs(now.to_secs().saturating_sub(3600)),
+            }
+        };
+        // The generationless dust this coin can put toward the fee, from its real
+        // value and age (`now - ctime`) — the quantity the node validates against.
+        let matured_dust = |u: &TrackedUtxo| -> u128 {
+            generationless_fee_availability(
+                &[u.value],
+                night_dust_ratio,
+                generation_decay_rate,
+                now,
+                coin_ctime(u),
+            )
+        };
+
+        // Register the single UNREGISTERED NIGHT UTXO with the most real matured dust —
+        // NOT the highest-value coin. A fresh high-value change output has ~0 matured
+        // dust and the node rejects its registration (custom error 173), while an older,
+        // smaller coin can self-fund the fee. A one-input registration keeps the fee
+        // minimal and avoids the ledger's multi-input time-to-dismiss rejection (168);
+        // callers re-invoke to register the rest (mirrors the Android SDK).
         let night_utxos: Vec<_> = {
-            let all: Vec<_> = self
+            let candidates: Vec<_> = self
                 .state
                 .unshielded_utxos()
                 .iter()
                 .filter(|u| u.token_type == night_hex)
+                .filter(|u| u.registered_for_dust_generation != Some(true))
                 .collect();
-            match all.into_iter().max_by_key(|u| u.value) {
+            match candidates.into_iter().max_by_key(|u| matured_dust(u)) {
                 Some(top) => vec![top],
                 None => {
                     return Err(WalletError::Transfer(
-                        "no tNIGHT UTXOs available for dust registration".into(),
+                        "no unregistered tNIGHT UTXOs available for dust registration".into(),
                     ))
                 }
             }
@@ -483,19 +508,10 @@ impl<'a> TransferBuilder<'a> {
             actions: vec![],
         };
 
-        let dust_params = &self.state.parameters().dust;
-        let now = self.context.latest_block_context().tblock;
-        let ctime = match utxo_ctime {
-            Some(t) => Timestamp::from_secs(t),
-            None => Timestamp::from_secs(now.to_secs().saturating_sub(3600)),
-        };
-        let allow_fee_payment = generationless_fee_availability(
-            &night_utxos.iter().map(|u| u.value).collect::<Vec<_>>(),
-            dust_params.night_dust_ratio,
-            dust_params.generation_decay_rate,
-            now,
-            ctime,
-        );
+        // The registration self-pays from the selected coin's OWN real matured dust,
+        // so `allow_fee_payment` is exactly what the node will credit — never an
+        // over-claim that gets rejected as custom error 173.
+        let allow_fee_payment = matured_dust(night_utxos[0]);
 
         let unshielded = UnshieldedWallet::default(seed.clone());
         let signing_key = unshielded.signing_key().clone();
@@ -1146,5 +1162,57 @@ mod tests {
             CoinSelectionStrategy::SmallestFirst,
             CoinSelectionStrategy::LargestFirst
         ));
+    }
+
+    // ── dust-registration coin selection: the crux of the highest-DUST fix ──
+    // These pin `generationless_fee_availability`, the quantity `register_dust`
+    // now ranks coins by (instead of raw value) to self-fund the registration fee.
+
+    /// The whole point of the fix: an OLD SMALL coin can self-fund more of the fee
+    /// than a FRESH LARGE one, because matured dust is value × age, not value.
+    #[test]
+    fn generationless_dust_prefers_an_aged_coin_over_a_fresh_larger_one() {
+        let ratio = 1_000u64;
+        let decay = 1u32;
+        let now = Timestamp::from_secs(1_000_000);
+
+        // Fresh large coin: 100× the value, but ctime == now (dt = 0).
+        let fresh_large = generationless_fee_availability(&[1_000_000], ratio, decay, now, now);
+        assert_eq!(fresh_large, 0, "a dt=0 coin has no matured dust, regardless of value");
+
+        // Aged small coin: 1/100th the value, but 3600s old.
+        let aged = Timestamp::from_secs(now.to_secs() - 3600);
+        let aged_small = generationless_fee_availability(&[10_000], ratio, decay, now, aged);
+        assert!(
+            aged_small > fresh_large,
+            "the aged smaller coin ({aged_small}) must out-fund the fresh larger one ({fresh_large}) — \
+             selecting by value would pick the un-fundable coin and the node would reject it (173)"
+        );
+    }
+
+    /// Matured dust grows linearly with age, then saturates at value × ratio.
+    #[test]
+    fn generationless_dust_grows_with_age_then_saturates() {
+        let ratio = 100u64;
+        let decay = 1u32;
+        let value = 1_000u128;
+        let now = Timestamp::from_secs(1_000_000);
+        let at = |age: u64| {
+            generationless_fee_availability(
+                &[value],
+                ratio,
+                decay,
+                now,
+                Timestamp::from_secs(now.to_secs() - age),
+            )
+        };
+
+        // Unsaturated: exactly age × value × decay.
+        assert_eq!(at(10), 10 * value * decay as u128);
+        assert!(at(50) > at(10), "more age → more matured dust");
+        // Saturates at value × ratio once age × decay ≥ ratio (here age ≥ 100).
+        let cap = value * ratio as u128;
+        assert_eq!(at(100), cap);
+        assert_eq!(at(10_000), cap, "further age can't exceed the cap");
     }
 }
