@@ -410,18 +410,27 @@ impl<'a> TransferBuilder<'a> {
         let seed = self.state.seed().clone();
         let night_hex = "0".repeat(64);
 
-        let night_utxos: Vec<_> = self
-            .state
-            .unshielded_utxos()
-            .iter()
-            .filter(|u| u.token_type == night_hex)
-            .collect();
-
-        if night_utxos.is_empty() {
-            return Err(WalletError::Transfer(
-                "no tNIGHT UTXOs available for dust registration".into(),
-            ));
-        }
+        // Register only the single highest-value NIGHT UTXO. It carries the most
+        // generationless dust to self-fund the registration fee, and a one-input
+        // registration keeps the fee minimal and avoids the ledger's multi-input
+        // time-to-dismiss rejection (error 168). Callers wanting every coin generating
+        // dust re-invoke until none remain unregistered (mirrors the Android SDK).
+        let night_utxos: Vec<_> = {
+            let all: Vec<_> = self
+                .state
+                .unshielded_utxos()
+                .iter()
+                .filter(|u| u.token_type == night_hex)
+                .collect();
+            match all.into_iter().max_by_key(|u| u.value) {
+                Some(top) => vec![top],
+                None => {
+                    return Err(WalletError::Transfer(
+                        "no tNIGHT UTXOs available for dust registration".into(),
+                    ))
+                }
+            }
+        };
 
         let mut inputs: VecDeque<Box<dyn BuildUtxoSpend<DefaultDB>>> = night_utxos
             .iter()
