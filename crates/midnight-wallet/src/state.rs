@@ -721,8 +721,21 @@ impl Wallet {
         // on a remote chain (real chains don't reset) nor on a transient indexer error.
         if network.is_local_dev() {
             if let Some(c) = cached.as_ref() {
-                if chain_reset_detected(&indexer_client, c).await {
-                    warn!("chain reset detected — discarding stale cached state, full resync");
+                // Two independent reset signals:
+                //  1. Height regression — a healthy chain only GROWS. If the current tip
+                //     is below where we last synced, the chain shrank ⇒ it was replaced.
+                //     This is the robust signal for a localnet whose block hashes are
+                //     DETERMINISTIC across resets (so the pinned-hash check below matches
+                //     once the fresh chain re-climbs past the pin height and misses it).
+                //  2. Pinned block gone / hash changed (fresh chain shorter, or hashes
+                //     are instance-specific).
+                let height_regressed = c.last_block_height > 0 && block.height < c.last_block_height;
+                if height_regressed || chain_reset_detected(&indexer_client, c).await {
+                    warn!(
+                        tip = block.height,
+                        cached_height = c.last_block_height,
+                        "chain reset detected — discarding stale cached state, full resync"
+                    );
                     cached = None;
                 }
             }
