@@ -47,6 +47,14 @@ pub enum Network {
 }
 
 impl Network {
+    /// Whether this is a LOCAL dev chain (localnet) — the only network the
+    /// chain-reset guard is allowed to WIPE on, since a `docker` down/up replaces
+    /// it with a fresh genesis. Real networks don't reset; a load-balanced or
+    /// pruned remote indexer must never trigger a wipe of a healthy wallet.
+    pub fn is_local_dev(&self) -> bool {
+        matches!(self, Network::Undeployed)
+    }
+
     /// The literal network name as used in the bech32 HRP (and matched against
     /// the ledger's `network_id`).
     pub fn as_str(&self) -> &str {

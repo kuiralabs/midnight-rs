@@ -118,6 +118,13 @@ pub struct Wallet {
     last_block_height: i64,
     last_tx_id: Option<i64>,
 
+    // Chain-identity pin: the tip block (height + hash) at this sync. Persisted,
+    // then re-looked-up on the next load to detect a chain reset (localnet down/up
+    // replaces the chain, so a resume from stale count-cursors would keep the old
+    // balance). See the guard in `sync_inner` + `chain_reset_detected`.
+    checkpoint_height: i64,
+    checkpoint_block_hash: Option<String>,
+
     // Chain parameters (from latest block via indexer HTTP)
     parameters: LedgerParameters,
     block_context: Option<BlockContext>,
@@ -239,6 +246,33 @@ const DUST_CHECKPOINT_INTERVAL: u64 = 50_000;
 
 type DustCheckpointFn = dyn Fn(&DustWallet<DefaultDB>, i64) + Send;
 
+/// Whether the cached checkpoint block no longer matches the current chain — the
+/// localnet-reset signal. Re-looks-up the pinned block by height: absent (the fresh
+/// chain is shorter) or a different hash (the fresh chain re-climbed past it) → reset.
+/// A transient indexer error is UNKNOWN (not a reset), so a blip never wipes a healthy
+/// wallet; no pin yet (pre-guard snapshot / height 0 = genesis) → not a reset.
+async fn chain_reset_detected(
+    client: &midnight_indexer_client::IndexerClient,
+    cached: &crate::storage::LoadedState,
+) -> bool {
+    let Some(pinned_hash) = cached.checkpoint_block_hash.as_ref() else {
+        return false;
+    };
+    if cached.checkpoint_height <= 0 {
+        return false;
+    }
+    match client
+        .get_block(Some(midnight_indexer_client::BlockOffset::height(
+            cached.checkpoint_height,
+        )))
+        .await
+    {
+        Ok(Some(block)) => &block.hash != pinned_hash,
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_dust_checkpoint(
     storage_dir: Option<&Path>,
@@ -248,6 +282,8 @@ fn make_dust_checkpoint(
     zswap_event_id: i64,
     last_block_height: i64,
     last_tx_id: Option<i64>,
+    checkpoint_height: i64,
+    checkpoint_block_hash: Option<String>,
     unshielded_utxos: Vec<TrackedUtxo>,
 ) -> Option<Box<DustCheckpointFn>> {
     storage_dir.map(|dir| {
@@ -264,6 +300,8 @@ fn make_dust_checkpoint(
                 dust_eid,
                 last_block_height,
                 last_tx_id,
+                checkpoint_height,
+                checkpoint_block_hash.clone(),
                 &unshielded_utxos,
             ) {
                 warn!(error = %err, "failed to checkpoint dust state");
@@ -626,10 +664,36 @@ impl Wallet {
         let network_id: &str = network.as_str();
         let wallet_id = wallet_storage_id(address);
         info!("loading cached state from disk");
-        let cached = match storage_dir {
+        let mut cached = match storage_dir {
             Some(dir) => crate::storage::load(dir, network_id, &wallet_id)?,
             None => None,
         };
+
+        // Fetch the current tip up front — needed for ledger parameters AND the
+        // chain-reset guard below.
+        info!("fetching latest block from indexer");
+        let indexer_client = midnight_indexer_client::IndexerClient::new(indexer_url)?;
+        let block = indexer_client
+            .get_block(None)
+            .await
+            .map_err(|e| WalletError::Sync(format!("fetch latest block: {e}")))?
+            .ok_or_else(|| WalletError::Sync("no blocks available from indexer".into()))?;
+
+        // Chain-reset guard (LOCAL dev chains only): a localnet `docker` down/up
+        // replaces the chain with a fresh genesis. The persisted cursors are event-id
+        // COUNTS, so a resume would re-climb the fresh chain to the same counts and
+        // conclude "already synced" — silently keeping the OLD balance. Re-look-up the
+        // cached checkpoint block; if its height is gone or its hash changed, the chain
+        // was replaced, so drop the stale cache and full-sync from genesis. Never wipes
+        // on a remote chain (real chains don't reset) nor on a transient indexer error.
+        if network.is_local_dev() {
+            if let Some(c) = cached.as_ref() {
+                if chain_reset_detected(&indexer_client, c).await {
+                    warn!("chain reset detected — discarding stale cached state, full resync");
+                    cached = None;
+                }
+            }
+        }
         let resuming = cached.is_some();
 
         if resuming {
@@ -653,14 +717,6 @@ impl Wallet {
 
         let shielded = ShieldedWallet::<DefaultDB>::default(seed.clone());
         let secret_keys = shielded.secret_keys().clone();
-
-        info!("fetching latest block from indexer");
-        let indexer_client = midnight_indexer_client::IndexerClient::new(indexer_url)?;
-        let block = indexer_client
-            .get_block(None)
-            .await
-            .map_err(|e| WalletError::Sync(format!("fetch latest block: {e}")))?
-            .ok_or_else(|| WalletError::Sync("no blocks available from indexer".into()))?;
 
         let parameters = decode_ledger_parameters(&block)?;
 
@@ -732,6 +788,8 @@ impl Wallet {
             zswap_event_id,
             last_block_height,
             Some(last_tx_id),
+            block.height,
+            Some(block.hash.clone()),
             unshielded_utxos.clone(),
         );
         let dust_resuming = start_dust_id > 0;
@@ -789,6 +847,10 @@ impl Wallet {
             unshielded_utxos,
             last_block_height,
             last_tx_id: Some(last_tx_id),
+            // Pin the tip block this sync observed, so the next load can detect a
+            // chain reset by re-looking-it-up.
+            checkpoint_height: block.height,
+            checkpoint_block_hash: Some(block.hash.clone()),
             parameters,
             block_context,
             pending,
@@ -956,6 +1018,8 @@ impl Wallet {
             self.dust_event_id,
             self.last_block_height,
             self.last_tx_id,
+            self.checkpoint_height,
+            self.checkpoint_block_hash.clone(),
             &self.unshielded_utxos,
         )?;
         crate::storage::save_pending(base, &self.network_id, &wallet_id, &self.pending)

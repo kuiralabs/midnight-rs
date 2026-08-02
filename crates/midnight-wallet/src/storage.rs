@@ -34,6 +34,15 @@ struct StoredMetadata {
     dust_event_id: i64,
     last_block_height: i64,
     last_tx_id: Option<i64>,
+    /// Chain-identity pin: a block (height + hash) ABOVE genesis, captured at the
+    /// last sync. Re-looked-up on the next load — if the pinned height is gone or
+    /// its hash changed, the chain was replaced (a localnet reset) and the cached
+    /// cursors are stale. `default` so pre-guard snapshots still load (no pin → no
+    /// check). See the chain-reset guard in `state::sync_inner`.
+    #[serde(default)]
+    checkpoint_height: i64,
+    #[serde(default)]
+    checkpoint_block_hash: Option<String>,
     unshielded_utxos: Vec<StoredUtxo>,
 }
 
@@ -190,6 +199,8 @@ pub(crate) struct LoadedState {
     pub dust_event_id: i64,
     pub last_block_height: i64,
     pub last_tx_id: Option<i64>,
+    pub checkpoint_height: i64,
+    pub checkpoint_block_hash: Option<String>,
     pub unshielded_utxos: Vec<TrackedUtxo>,
 }
 
@@ -236,6 +247,8 @@ pub(crate) fn load(
         dust_event_id: metadata.dust_event_id,
         last_block_height: metadata.last_block_height,
         last_tx_id: metadata.last_tx_id,
+        checkpoint_height: metadata.checkpoint_height,
+        checkpoint_block_hash: metadata.checkpoint_block_hash,
         unshielded_utxos,
     }))
 }
@@ -251,6 +264,8 @@ pub(crate) fn save(
     dust_event_id: i64,
     last_block_height: i64,
     last_tx_id: Option<i64>,
+    checkpoint_height: i64,
+    checkpoint_block_hash: Option<String>,
     unshielded_utxos: &[TrackedUtxo],
 ) -> Result<(), WalletError> {
     let dir = storage_dir(base, network, wallet_id);
@@ -278,6 +293,8 @@ pub(crate) fn save(
         dust_event_id,
         last_block_height,
         last_tx_id,
+        checkpoint_height,
+        checkpoint_block_hash,
         unshielded_utxos: unshielded_utxos.iter().map(StoredUtxo::from).collect(),
     };
     let meta_tmp = dir.join("metadata.json.tmp");
