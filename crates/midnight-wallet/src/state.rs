@@ -267,9 +267,42 @@ async fn chain_reset_detected(
         )))
         .await
     {
-        Ok(Some(block)) => &block.hash != pinned_hash,
-        Ok(None) => true,
+        Ok(looked_up) => checkpoint_diverged(pinned_hash, looked_up.as_ref().map(|b| b.hash.as_str())),
+        // Transient indexer error → UNKNOWN: never wipe a healthy wallet on a blip.
         Err(_) => false,
+    }
+}
+
+/// Pure reset decision (unit-tested): given the pinned block hash and the hash the
+/// indexer now returns for that height (`None` = the height is not on the chain),
+/// did the chain diverge? A different hash (fresh chain re-climbed past the pin) or
+/// a missing height (fresh chain is shorter) both mean the chain was replaced.
+fn checkpoint_diverged(pinned_hash: &str, looked_up_hash: Option<&str>) -> bool {
+    match looked_up_hash {
+        Some(h) => h != pinned_hash,
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod chain_reset_guard_tests {
+    use super::checkpoint_diverged;
+
+    #[test]
+    fn same_hash_at_pinned_height_is_not_a_reset() {
+        assert!(!checkpoint_diverged("blockhash_abc", Some("blockhash_abc")));
+    }
+
+    #[test]
+    fn different_hash_at_pinned_height_is_a_reset() {
+        // Fresh chain re-climbed past the pin with instance-specific block hashes.
+        assert!(checkpoint_diverged("blockhash_abc", Some("blockhash_xyz")));
+    }
+
+    #[test]
+    fn missing_pinned_height_is_a_reset() {
+        // Fresh chain is shorter than the old tip — the pinned height is gone.
+        assert!(checkpoint_diverged("blockhash_abc", None));
     }
 }
 
@@ -2361,6 +2394,8 @@ mod tests {
             unshielded_utxos: Vec::new(),
             last_block_height: 0,
             last_tx_id: None,
+            checkpoint_height: 0,
+            checkpoint_block_hash: None,
             parameters: INITIAL_PARAMETERS,
             block_context: None,
             pending: PendingReservations::default(),
