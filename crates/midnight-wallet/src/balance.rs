@@ -12,6 +12,11 @@ pub struct DustBalance {
     /// Current dust balance in SPECK (1 DUST = 10^15 SPECK).
     /// Computed at the time of the balance query using UTXO age and generation parameters.
     pub balance_speck: u128,
+    /// Whether any tracked NIGHT UTXO is registered for dust generation. The
+    /// per-UTXO `registered_for_dust_generation` flag is only ever `Some(true)`
+    /// on a registered NIGHT coin, so any-true is the wallet's "dust registered"
+    /// state — drives the wallet UI's `✓ registered` vs `Register` affordance.
+    pub registered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -133,9 +138,14 @@ impl Wallet {
             .map(|bc| bc.tblock)
             .unwrap_or_else(|| Timestamp::from_secs(0));
         let balance_speck = local_state.map(|s| s.wallet_balance(now)).unwrap_or(0);
+        let registered = self
+            .unshielded_utxos()
+            .iter()
+            .any(|u| u.registered_for_dust_generation == Some(true));
         DustBalance {
             spendable_utxos: count,
             balance_speck,
+            registered,
         }
     }
 
