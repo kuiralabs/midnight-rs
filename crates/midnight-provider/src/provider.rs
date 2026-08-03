@@ -509,6 +509,29 @@ impl MidnightProvider {
         Ok(())
     }
 
+    /// Rebuild the wallet from GENESIS — a full event replay from scratch, the last-resort
+    /// rung of the send-hardening recovery ladder (when a delta [`Self::resync_wallet`]
+    /// doesn't clear a stale-dust rejection). Same plan → replay → commit shape and the same
+    /// resync-serialization guard as [`Self::resync_wallet`], but the plan is
+    /// [`Wallet::resync_plan_from_genesis`] (fresh state, cursors at 0). Do not hold a
+    /// [`Self::wallet`] guard across this call (the commit's write lock would deadlock).
+    pub async fn resync_wallet_from_genesis(&self) -> Result<(), ProviderError> {
+        self.wait_for_chain_ready().await?;
+        let arc = self.wallet.as_ref().ok_or(ProviderError::NoWallet)?;
+
+        let _resync_guard = self.resync_lock.lock().await;
+
+        // Brief read lock: snapshot the genesis (fresh-state, cursor-0) replay inputs.
+        let plan = arc.read().await.resync_plan_from_genesis();
+
+        // Long I/O, lock-free: replay every event from genesis.
+        let commit = plan.run(&self.indexer_url).await?;
+
+        // Brief write lock: apply and persist.
+        arc.write().await.commit_resync(commit)?;
+        Ok(())
+    }
+
     /// Wait until the chain has produced at least one post-genesis block.
     ///
     /// Returns immediately on any chain with block height ≥ 1. On a fresh

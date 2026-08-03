@@ -1383,6 +1383,33 @@ impl Wallet {
         }
     }
 
+    /// A [`ResyncPlan`] that rebuilds the wallet from GENESIS: fresh shielded / dust / UTXO
+    /// state (exactly as the initial sync's uncached branch — [`ShieldedWallet::default`],
+    /// an empty UTXO set, [`DustWallet::default`]) with the cursors reset so every
+    /// subscription replays from event 0.
+    ///
+    /// The last-resort rung of the send-hardening recovery ladder: when a delta
+    /// [`Self::resync_plan`] doesn't clear a stale-dust rejection (a locally-corrupt root),
+    /// a full genesis replay reconstructs confirmed state from scratch. Mirrors the Android
+    /// SDK's delta→genesis escalation. `commit_resync` overwrites the replay-derived state
+    /// and refreshes `parameters`/`block_context` from the chain view the replay fetched.
+    ///
+    /// The `-1` cursors are deliberate: [`ResyncPlan::run`] starts each event subscription at
+    /// `event_id + 1`, so `-1 + 1 = 0` (genesis); `last_tx_id: None` starts the UTXO stream at 0.
+    pub fn resync_plan_from_genesis(&self) -> ResyncPlan {
+        let shielded = ShieldedWallet::<DefaultDB>::default(self.seed.clone());
+        ResyncPlan {
+            secret_keys: self.secret_keys.clone(),
+            unshielded_address: self.unshielded_address.clone(),
+            dust_wallet: DustWallet::default(self.seed.clone(), Some(&self.parameters)),
+            dust_event_id: -1,
+            zswap_state: shielded.state.clone(),
+            zswap_event_id: -1,
+            unshielded_utxos: Vec::new(),
+            last_tx_id: None,
+        }
+    }
+
     /// Apply validated resync results to `self` and persist when (and only
     /// when) durable state changed. Factored out of [`Wallet::resync`]
     /// (which performs the I/O and validation via [`ResyncPlan::run`]) so
