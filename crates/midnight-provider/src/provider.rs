@@ -1440,6 +1440,33 @@ impl MidnightProvider {
         Ok(chain)
     }
 
+    /// The midnight-ledger protocol version this client is BUILT against — the pinned
+    /// `midnight-ledger` dependency (see `Cargo.toml`). Compared against
+    /// [`Self::node_ledger_version`] for a submit pre-flight. MUST be kept in sync with the
+    /// `midnight-ledger` version requirement in `Cargo.toml` (the crate exposes no version
+    /// constant of its own); the send e2e catches drift on a matching node.
+    pub const CLIENT_LEDGER_VERSION: &'static str = "8.1.0";
+
+    /// The node's ledger-protocol version (substrate RPC `midnight_ledgerVersion`), e.g.
+    /// `"=8.1.0"`. A submit pre-flight compares this against [`Self::CLIENT_LEDGER_VERSION`]
+    /// so a client↔node version skew is caught EARLY — before building/proving a transaction
+    /// the node would reject with an opaque `Custom error: N`.
+    pub async fn node_ledger_version(&self) -> Result<String, ProviderError> {
+        let conn = self.get_or_connect().await?;
+
+        let version: String = match conn.rpc.request("midnight_ledgerVersion", RpcParams::new()).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "midnight_ledgerVersion failed");
+                return Err(ProviderError::Rpc(e.to_string()));
+            }
+        };
+
+        debug!(version = %version, "midnight_ledgerVersion response");
+
+        Ok(version)
+    }
+
     /// The ledger's network id, read from current ledger state.
     ///
     /// This is the authoritative value: it is what binds a transaction
