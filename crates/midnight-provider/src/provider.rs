@@ -1462,7 +1462,7 @@ mod tests {
             MidnightProvider::new("ws://localhost:9944", "http://localhost:8088").unwrap();
         assert_eq!(
             provider.indexer.url(),
-            "http://localhost:8088/api/v3/graphql"
+            "http://localhost:8088/api/v4/graphql"
         );
     }
 

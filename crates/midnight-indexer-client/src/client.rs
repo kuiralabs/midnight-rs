@@ -15,15 +15,18 @@ pub struct IndexerClient {
 }
 
 impl IndexerClient {
-    /// Create a new client. Appends `/api/v3/graphql` if not present.
+    /// Create a new client. Appends [`crate::GRAPHQL_PATH`] if not present.
     /// Returns an error if the HTTP client cannot be built.
     pub fn new(base_url: &str) -> Result<Self, IndexerError> {
         let base = base_url.trim_end_matches('/');
 
-        let http_url = if base.ends_with("/api/v3/graphql") {
+        // Accept a v3 URL a caller may still be passing: it is an alias for the same endpoint, so
+        // rewriting it would break nothing, but silently changing a caller's explicit URL is worse
+        // than honouring it.
+        let http_url = if base.ends_with(crate::GRAPHQL_PATH) || base.ends_with("/api/v3/graphql") {
             base.to_string()
         } else {
-            format!("{base}/api/v3/graphql")
+            format!("{base}{}", crate::GRAPHQL_PATH)
         };
 
         let http = reqwest::Client::builder()
@@ -213,19 +216,19 @@ mod tests {
     #[test]
     fn url_construction_bare_host() {
         let client = IndexerClient::new("http://localhost:8088").unwrap();
-        assert_eq!(client.url(), "http://localhost:8088/api/v3/graphql");
+        assert_eq!(client.url(), "http://localhost:8088/api/v4/graphql");
     }
 
     #[test]
     fn url_construction_with_trailing_slash() {
         let client = IndexerClient::new("http://localhost:8088/").unwrap();
-        assert_eq!(client.url(), "http://localhost:8088/api/v3/graphql");
+        assert_eq!(client.url(), "http://localhost:8088/api/v4/graphql");
     }
 
     #[test]
     fn url_construction_full_path() {
-        let client = IndexerClient::new("http://localhost:8088/api/v3/graphql").unwrap();
-        assert_eq!(client.url(), "http://localhost:8088/api/v3/graphql");
+        let client = IndexerClient::new("http://localhost:8088/api/v4/graphql").unwrap();
+        assert_eq!(client.url(), "http://localhost:8088/api/v4/graphql");
     }
 
     #[test]
@@ -233,7 +236,7 @@ mod tests {
         let client = IndexerClient::new("https://indexer.midnight.network").unwrap();
         assert_eq!(
             client.url(),
-            "https://indexer.midnight.network/api/v3/graphql"
+            "https://indexer.midnight.network/api/v4/graphql"
         );
     }
 }
