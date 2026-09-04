@@ -124,7 +124,7 @@ impl SubscriptionClient {
     ///
     /// `ws_url` should be the base indexer URL (e.g. `http://127.0.0.1:8088`)
     /// or the full WebSocket subscription path. The client will normalize the
-    /// URL to the subscription endpoint at `/api/v3/graphql/ws`.
+    /// URL to the subscription endpoint at [`crate::GRAPHQL_WS_PATH`].
     pub fn new(ws_url: impl Into<String>) -> Self {
         let raw: String = ws_url.into();
         let base = raw.trim_end_matches('/');
@@ -133,7 +133,7 @@ impl SubscriptionClient {
         } else if base.ends_with("/graphql") {
             format!("{base}/ws")
         } else {
-            format!("{base}/api/v3/graphql/ws")
+            format!("{base}{}", crate::GRAPHQL_WS_PATH)
         };
         // Ensure ws:// or wss:// scheme
         if url.starts_with("http://") {
