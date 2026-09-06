@@ -28,6 +28,15 @@ pub struct LocalWallet {
     inner: RwLock<Wallet>,
 }
 
+/// How much of the wallet a resync rebuilds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResyncDepth {
+    /// Extend the cached state from where it left off.
+    Delta,
+    /// Discard it and replay every event from genesis.
+    Genesis,
+}
+
 impl LocalWallet {
     pub fn new(wallet: Wallet) -> Self {
         Self {
@@ -39,6 +48,80 @@ impl LocalWallet {
 impl From<Wallet> for LocalWallet {
     fn from(wallet: Wallet) -> Self {
         Self::new(wallet)
+    }
+}
+
+/// The shared plan -> replay -> commit discipline behind both resync entry points.
+///
+/// One copy, because the parts that are easy to get wrong — taking the replacement pin
+/// before the check, holding the wallet lock only around the snapshot and the commit — are
+/// the same either way, and a second copy is where they drift.
+impl LocalWallet {
+    async fn resync_with(&self, chain: &dyn ChainView, depth: ResyncDepth) -> Result<(), WalletError> {
+        let (pin, snapshot, indexer_url) = {
+            let wallet = self.inner.read().await;
+            (
+                wallet.chain_pin().cloned(),
+                wallet.snapshot_dir(),
+                wallet.indexer_url().to_string(),
+            )
+        };
+
+        // Take the replacement pin before the check, not after the commit. It
+        // is the mark this resync's state belongs to, and a chain replaced at
+        // any point after this reads as replaced next time. Taken afterwards,
+        // a swap during the resync would be stamped with the new chain's own
+        // block, and every later check would pass against a chain this state
+        // never saw.
+        let replacement = if pin.is_some() {
+            current_pin(chain).await
+        } else {
+            None
+        };
+
+        if let Some(pin) = &pin {
+            match verify_pin(chain, pin).await {
+                ChainCheck::SameChain => {}
+                // A node that cannot answer leaves the wallet alone: a pruned
+                // archive must not condemn a healthy one.
+                ChainCheck::Unknown => warn!(
+                    height = pin.height,
+                    "node could not answer for the pinned block; keeping the cached state"
+                ),
+                // A replaced chain is fatal to a delta resync, whose cursors belong to the
+                // chain that is gone. It is also the exact condition a genesis rebuild cures,
+                // so refusing here would deny the recovery to the only caller that needs it.
+                ChainCheck::Replaced { .. } if depth == ResyncDepth::Genesis => {}
+                ChainCheck::Replaced { found } => {
+                    return Err(WalletError::ChainMismatch {
+                        path: snapshot
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "the wallet snapshot".to_string()),
+                        pinned_height: pin.height,
+                        pinned_hash: pin.hash.clone(),
+                        found: found.unwrap_or_else(|| "no block".to_string()),
+                    });
+                }
+            }
+        }
+
+        // The plan is snapshotted under a read lock and the commit applied
+        // under a write one, so the replay in between runs with the wallet
+        // free.
+        let plan = match depth {
+            ResyncDepth::Delta => self.inner.read().await.resync_plan(),
+            ResyncDepth::Genesis => self.inner.read().await.resync_plan_from_genesis(),
+        };
+        let commit = plan.run(&indexer_url).await?;
+        self.inner.write().await.commit_resync(commit)?;
+
+        // Move the pin forward with the commit, so a wallet that runs for a
+        // long time keeps a recent mark rather than one an archive has since
+        // pruned, which would leave every later check inconclusive.
+        if let Some(fresh) = replacement {
+            self.inner.write().await.set_chain_pin(fresh);
+        }
+        Ok(())
     }
 }
 
@@ -196,63 +279,15 @@ impl WalletFacade for LocalWallet {
     }
 
     async fn resync(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
-        let (pin, snapshot, indexer_url) = {
-            let wallet = self.inner.read().await;
-            (
-                wallet.chain_pin().cloned(),
-                wallet.snapshot_dir(),
-                wallet.indexer_url().to_string(),
-            )
-        };
+        self.resync_with(chain, ResyncDepth::Delta).await
+    }
 
-        // Take the replacement pin before the check, not after the commit. It
-        // is the mark this resync's state belongs to, and a chain replaced at
-        // any point after this reads as replaced next time. Taken afterwards,
-        // a swap during the resync would be stamped with the new chain's own
-        // block, and every later check would pass against a chain this state
-        // never saw.
-        let replacement = if pin.is_some() {
-            current_pin(chain).await
-        } else {
-            None
-        };
-
-        if let Some(pin) = &pin {
-            match verify_pin(chain, pin).await {
-                ChainCheck::SameChain => {}
-                // A node that cannot answer leaves the wallet alone: a pruned
-                // archive must not condemn a healthy one.
-                ChainCheck::Unknown => warn!(
-                    height = pin.height,
-                    "node could not answer for the pinned block; keeping the cached state"
-                ),
-                ChainCheck::Replaced { found } => {
-                    return Err(WalletError::ChainMismatch {
-                        path: snapshot
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "the wallet snapshot".to_string()),
-                        pinned_height: pin.height,
-                        pinned_hash: pin.hash.clone(),
-                        found: found.unwrap_or_else(|| "no block".to_string()),
-                    });
-                }
-            }
-        }
-
-        // The plan is snapshotted under a read lock and the commit applied
-        // under a write one, so the replay in between runs with the wallet
-        // free.
-        let plan = self.inner.read().await.resync_plan();
-        let commit = plan.run(&indexer_url).await?;
-        self.inner.write().await.commit_resync(commit)?;
-
-        // Move the pin forward with the commit, so a wallet that runs for a
-        // long time keeps a recent mark rather than one an archive has since
-        // pruned, which would leave every later check inconclusive.
-        if let Some(fresh) = replacement {
-            self.inner.write().await.set_chain_pin(fresh);
-        }
-        Ok(())
+    /// Rebuild every cursor from genesis, discarding the cached state rather than extending
+    /// it. The last resort when a delta resync cannot clear a locally-corrupt root — and the
+    /// in-process equivalent of deleting the snapshot directory, which a running wallet
+    /// holding that directory open cannot do to itself.
+    async fn resync_from_genesis(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
+        self.resync_with(chain, ResyncDepth::Genesis).await
     }
 
     async fn rescan_shielded(&self) -> Result<(), WalletError> {

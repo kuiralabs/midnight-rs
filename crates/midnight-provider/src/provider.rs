@@ -291,6 +291,24 @@ impl MidnightProvider {
         Ok(())
     }
 
+    /// Rebuild the wallet from GENESIS — the last rung of the recovery ladder, when a delta
+    /// [`Self::resync_wallet`] does not clear a stale-dust rejection.
+    ///
+    /// Same serialization as [`Self::resync_wallet`]: the wallet owns its own plan, replay and
+    /// commit, so reads keep completing while the replay runs.
+    pub async fn resync_wallet_from_genesis(&self) -> Result<(), ProviderError> {
+        // Boxed for the same reason as `resync_wallet`: the replay future is large in a debug
+        // build and would otherwise be carried by every future that awaits it.
+        Box::pin(self.resync_wallet_from_genesis_inner()).await
+    }
+
+    async fn resync_wallet_from_genesis_inner(&self) -> Result<(), ProviderError> {
+        let arc = self.wallet.as_ref().ok_or(ProviderError::NoWallet)?;
+        let _resync_guard = self.resync_lock.lock().await;
+        arc.resync_from_genesis(self).await?;
+        Ok(())
+    }
+
     /// Register a coin the wallet owns but cannot discover, then replay the
     /// shielded stream so the registration is honoured.
     ///

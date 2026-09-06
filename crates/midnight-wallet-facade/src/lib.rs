@@ -195,6 +195,22 @@ pub trait WalletFacade: Send + Sync {
     /// that pins its snapshot checks it here and moves it forward afterwards.
     async fn resync(&self, chain: &dyn ChainView) -> Result<(), WalletError>;
 
+    /// Rebuild every cursor from genesis, discarding the cached state rather than extending it.
+    ///
+    /// The last resort when a delta [`Self::resync`] cannot clear a locally-corrupt root. It is
+    /// the in-process equivalent of deleting the snapshot directory — which a running wallet
+    /// holding that directory open cannot do to itself, and which also cannot keep serving reads
+    /// while it happens, as a resync does.
+    ///
+    /// Unlike [`Self::resync`], a replaced chain is not an error here: that is the condition this
+    /// call exists to recover from.
+    ///
+    /// Defaults to [`Self::resync`] so an implementation with no cheaper rebuild than its ordinary
+    /// resync — a test double, or a wallet that never caches — stays correct without writing one.
+    async fn resync_from_genesis(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
+        self.resync(chain).await
+    }
+
     /// Replay the shielded event stream from its first event and rebuild the
     /// shielded state from it. Dust state, unshielded state, and their cursors
     /// are left alone.
