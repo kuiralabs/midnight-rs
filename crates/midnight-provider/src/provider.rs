@@ -1169,7 +1169,11 @@ impl MidnightProvider {
     pub async fn node_ledger_version(&self) -> Result<String, ProviderError> {
         let conn = self.get_or_connect().await?;
 
-        let version: String = match conn.rpc.request("midnight_ledgerVersion", RpcParams::new()).await {
+        let version: String = match conn
+            .rpc
+            .request("midnight_ledgerVersion", RpcParams::new())
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "midnight_ledgerVersion failed");

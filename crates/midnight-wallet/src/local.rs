@@ -57,7 +57,11 @@ impl From<Wallet> for LocalWallet {
 /// before the check, holding the wallet lock only around the snapshot and the commit — are
 /// the same either way, and a second copy is where they drift.
 impl LocalWallet {
-    async fn resync_with(&self, chain: &dyn ChainView, depth: ResyncDepth) -> Result<(), WalletError> {
+    async fn resync_with(
+        &self,
+        chain: &dyn ChainView,
+        depth: ResyncDepth,
+    ) -> Result<(), WalletError> {
         let (pin, snapshot, indexer_url) = {
             let wallet = self.inner.read().await;
             (
