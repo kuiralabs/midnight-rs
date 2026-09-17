@@ -3729,7 +3729,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// A snapshot that carries no pin cannot be shown to belong to this chain, so a sync that
     /// CAN pin rebuilds instead of resuming. This is the case that stranded a real wallet: its
     /// zswap cursor sat at 351 on a chain whose highest event was 147, the subscription answered
