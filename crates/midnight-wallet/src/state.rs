@@ -356,6 +356,20 @@ fn already_applied(msg_id: i64, last_id: i64, start_id: i64, applied_any: bool) 
     (applied_any || start_id > 0) && msg_id <= last_id
 }
 
+/// Whether a loaded snapshot must be discarded rather than resumed from.
+///
+/// A snapshot is only vouched for by its own chain pin: the cursors are counts, and counts
+/// cannot identify a chain, because a replaced chain restarts ids at 0 and re-climbs to the
+/// same ones. So an unpinned snapshot could have come from any chain, including one that no
+/// longer exists.
+///
+/// `can_pin` is whether THIS sync has node access to take a pin — only such a caller can
+/// rebuild into a vouched snapshot, and only it is asked to pay for one. A caller without node
+/// access has no better option than resuming, and is left alone.
+fn discard_unvouched_snapshot(can_pin: bool, snapshot_is_pinned: bool) -> bool {
+    can_pin && !snapshot_is_pinned
+}
+
 /// Per-connection event order check for the replay loops.
 ///
 /// `conn_high` is the highest event id the *current* subscription
@@ -779,10 +793,33 @@ impl Wallet {
         let network_id: &str = network.as_str();
         let wallet_id = wallet_storage_id(address);
         info!("loading cached state from disk");
-        let cached = match storage_dir {
+        let mut cached = match storage_dir {
             Some(dir) => crate::storage::load(dir, network_id, &wallet_id)?,
             None => None,
         };
+        // An unpinned snapshot has unknown provenance. Nothing in it records which chain its
+        // cursors were counted on, and the cursors cannot tell on their own: a replaced chain
+        // restarts ids at 0 and re-climbs to the same counts, so a resume reports the dead
+        // chain's balance without complaint. While the new chain is still SHORTER the resume is
+        // worse than wrong, it is stuck — the cursor names an event the chain does not have, the
+        // subscription answers with silence, and silence reads as "already at tip" on every
+        // launch thereafter.
+        //
+        // Trusting such a snapshot is precisely what the pin exists to prevent, so a caller that
+        // can pin refuses it and rebuilds instead. `chain_pin.is_some()` identifies that caller:
+        // the parameter carries the fresh pin this sync just took from its chain view. A caller
+        // without node access has nothing better to do than resume, and is left alone.
+        //
+        // This is a one-time cost. The rebuilt snapshot is saved WITH a pin, so it never
+        // qualifies again, and from then on `verify_pin` catches a replacement directly.
+        let snapshot_is_pinned = matches!(cached.as_ref(), Some(c) if c.chain_pin.is_some());
+        if cached.is_some() && discard_unvouched_snapshot(chain_pin.is_some(), snapshot_is_pinned) {
+            warn!(
+                "cached state carries no chain pin, so it cannot be shown to belong to this \
+                 chain; discarding it and rebuilding from genesis"
+            );
+            cached = None;
+        }
         // Keep the snapshot's own pin when this sync has no fresher one. A
         // node that could not answer must not cost the wallet the mark that
         // lets the next resume check itself.
@@ -3690,6 +3727,23 @@ mod tests {
             ),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    /// A snapshot that carries no pin cannot be shown to belong to this chain, so a sync that
+    /// CAN pin rebuilds instead of resuming. This is the case that stranded a real wallet: its
+    /// zswap cursor sat at 351 on a chain whose highest event was 147, the subscription answered
+    /// with silence, and silence was read as "already at tip" on every launch.
+    #[test]
+    fn an_unpinned_snapshot_is_discarded_only_by_a_sync_that_can_pin() {
+        // Node access + an unvouched snapshot: rebuild.
+        assert!(discard_unvouched_snapshot(true, false));
+        // Node access + a vouched snapshot: resume, and let `verify_pin` judge it.
+        assert!(!discard_unvouched_snapshot(true, true));
+        // No node access: nothing better than resuming is available, so never discard —
+        // otherwise an in-memory or offline caller would rebuild from genesis every time.
+        assert!(!discard_unvouched_snapshot(false, false));
+        assert!(!discard_unvouched_snapshot(false, true));
     }
 
     #[test]
