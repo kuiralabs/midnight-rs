@@ -7,6 +7,9 @@ pub mod transfer;
 mod types;
 
 pub use error::ProviderError;
+/// What [`MidnightProvider::new`] takes for its indexer: a URL, or an endpoint
+/// with its own layout and credential.
+pub use midnight_indexer_client::{IndexerCredential, IndexerEndpoint};
 pub use provider::{HeldInputs, MidnightProvider, NodeBlockHash, NodeHeader};
 pub use remote_prover::RemoteProofServer;
 pub use submit::{PendingTx, PreparedTx, SubmitError, TxInBlock, Verdict};

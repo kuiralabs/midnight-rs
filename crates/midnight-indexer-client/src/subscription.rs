@@ -40,6 +40,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 
+use crate::endpoint::{IndexerCredential, IndexerEndpoint};
 use crate::error::IndexerError;
 
 /// Default bound on TCP/TLS connect plus the `connection_init`/`connection_ack`
@@ -114,6 +115,7 @@ impl<T> Subscription<T> {
 /// Supports the `graphql-transport-ws` protocol (used by modern GraphQL servers).
 pub struct SubscriptionClient {
     ws_url: String,
+    credential: Option<IndexerCredential>,
     connect_timeout: Duration,
     ping_after: Duration,
     idle_timeout: Duration,
@@ -122,27 +124,15 @@ pub struct SubscriptionClient {
 impl SubscriptionClient {
     /// Create a new subscription client.
     ///
-    /// `ws_url` should be the base indexer URL (e.g. `http://127.0.0.1:8088`)
-    /// or the full WebSocket subscription path. The client will normalize the
-    /// URL to the subscription endpoint at [`crate::GRAPHQL_WS_PATH`].
-    pub fn new(ws_url: impl Into<String>) -> Self {
-        let raw: String = ws_url.into();
-        let base = raw.trim_end_matches('/');
-        let mut url = if base.ends_with("/graphql/ws") {
-            base.to_string()
-        } else if base.ends_with("/graphql") {
-            format!("{base}/ws")
-        } else {
-            format!("{base}{}", crate::GRAPHQL_WS_PATH)
-        };
-        // Ensure ws:// or wss:// scheme
-        if url.starts_with("http://") {
-            url = format!("ws://{}", &url[7..]);
-        } else if url.starts_with("https://") {
-            url = format!("wss://{}", &url[8..]);
-        }
+    /// A bare URL — the base indexer URL (e.g. `http://127.0.0.1:8088`) or a
+    /// full GraphQL or subscription path — takes the self-hosted layout (see
+    /// [`IndexerEndpoint::from_base`]). An [`IndexerEndpoint`] is used as
+    /// given, and its credential is sent on the connection request.
+    pub fn new(endpoint: impl Into<IndexerEndpoint>) -> Self {
+        let endpoint = endpoint.into();
         Self {
-            ws_url: url,
+            ws_url: endpoint.ws_url().to_string(),
+            credential: endpoint.credential().cloned(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             ping_after: DEFAULT_KEEPALIVE_PING_AFTER,
             idle_timeout: DEFAULT_KEEPALIVE_IDLE_TIMEOUT,
@@ -204,9 +194,13 @@ impl SubscriptionClient {
             .header(
                 "Sec-WebSocket-Key",
                 tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-            )
-            .body(())
-            .map_err(|e| IndexerError::Config(format!("build WS request: {e}")))?;
+            );
+        let request = match &self.credential {
+            Some(credential) => request.header(credential.header(), credential.value()),
+            None => request,
+        }
+        .body(())
+        .map_err(|e| IndexerError::Config(format!("build WS request: {e}")))?;
 
         // One deadline covers TCP/TLS connect plus the init/ack handshake
         // (timeout 1 in the module doc), so a caller-side wrapper timeout is

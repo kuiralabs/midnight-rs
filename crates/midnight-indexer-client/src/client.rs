@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::{debug, warn};
 
+use crate::endpoint::IndexerEndpoint;
 use crate::error::IndexerError;
 use crate::queries;
 use crate::types::*;
@@ -11,35 +12,32 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct IndexerClient {
     http: reqwest::Client,
-    http_url: String,
+    endpoint: IndexerEndpoint,
 }
 
 impl IndexerClient {
-    /// Create a new client. Appends [`crate::GRAPHQL_PATH`] if not present.
-    /// Returns an error if the HTTP client cannot be built.
-    pub fn new(base_url: &str) -> Result<Self, IndexerError> {
-        let base = base_url.trim_end_matches('/');
-
-        // Accept a v3 URL a caller may still be passing: it is an alias for the same endpoint, so
-        // rewriting it would break nothing, but silently changing a caller's explicit URL is worse
-        // than honouring it.
-        let http_url = if base.ends_with(crate::GRAPHQL_PATH) || base.ends_with("/api/v3/graphql") {
-            base.to_string()
-        } else {
-            format!("{base}{}", crate::GRAPHQL_PATH)
-        };
-
+    /// Create a new client. A bare URL takes the self-hosted indexer's layout
+    /// (see [`IndexerEndpoint::from_base`]); an [`IndexerEndpoint`] is used as
+    /// given, credential included. Returns an error if the HTTP client cannot
+    /// be built.
+    pub fn new(endpoint: impl Into<IndexerEndpoint>) -> Result<Self, IndexerError> {
+        let endpoint = endpoint.into();
         let http = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
             .build()
             .map_err(|e| IndexerError::Config(e.to_string()))?;
 
-        Ok(Self { http, http_url })
+        Ok(Self { http, endpoint })
     }
 
-    /// URL the client is connected to.
+    /// URL the client posts GraphQL to.
     pub fn url(&self) -> &str {
-        &self.http_url
+        self.endpoint.graphql_url()
+    }
+
+    /// The endpoint this client was built for.
+    pub fn endpoint(&self) -> &IndexerEndpoint {
+        &self.endpoint
     }
 
     async fn execute<V: Serialize, R: DeserializeOwned>(
@@ -52,15 +50,13 @@ impl IndexerClient {
             "variables": variables,
         });
 
-        debug!(url = %self.http_url, "executing indexer GraphQL query");
+        debug!(url = %self.url(), "executing indexer GraphQL query");
 
-        let resp = self
-            .http
-            .post(&self.http_url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let mut request = self.http.post(self.url()).json(&body);
+        if let Some(credential) = self.endpoint.credential() {
+            request = request.header(credential.header(), credential.value());
+        }
+        let resp = request.send().await?.error_for_status()?;
 
         let text = resp.text().await?;
 

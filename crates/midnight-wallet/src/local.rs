@@ -62,12 +62,12 @@ impl LocalWallet {
         chain: &dyn ChainView,
         depth: ResyncDepth,
     ) -> Result<(), WalletError> {
-        let (pin, snapshot, indexer_url) = {
+        let (pin, snapshot, indexer) = {
             let wallet = self.inner.read().await;
             (
                 wallet.chain_pin().cloned(),
                 wallet.snapshot_dir(),
-                wallet.indexer_url().to_string(),
+                wallet.indexer_url().clone(),
             )
         };
 
@@ -116,7 +116,7 @@ impl LocalWallet {
             ResyncDepth::Delta => self.inner.read().await.resync_plan(),
             ResyncDepth::Genesis => self.inner.read().await.resync_plan_from_genesis(),
         };
-        let commit = plan.run(&indexer_url).await?;
+        let commit = plan.run(&indexer).await?;
         self.inner.write().await.commit_resync(commit)?;
 
         // Move the pin forward with the commit, so a wallet that runs for a
@@ -295,14 +295,11 @@ impl WalletFacade for LocalWallet {
     }
 
     async fn rescan_shielded(&self) -> Result<(), WalletError> {
-        let (plan, indexer_url) = {
+        let (plan, indexer) = {
             let wallet = self.inner.read().await;
-            (
-                wallet.shielded_rescan_plan(),
-                wallet.indexer_url().to_string(),
-            )
+            (wallet.shielded_rescan_plan(), wallet.indexer_url().clone())
         };
-        let commit = plan.run(&indexer_url).await?;
+        let commit = plan.run(&indexer).await?;
         self.inner.write().await.commit_shielded_rescan(commit)
     }
 

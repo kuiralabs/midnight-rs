@@ -16,6 +16,7 @@ pub const GRAPHQL_PATH: &str = "/api/v4/graphql";
 pub const GRAPHQL_WS_PATH: &str = "/api/v4/graphql/ws";
 
 mod client;
+pub mod endpoint;
 mod error;
 pub mod queries;
 pub mod subscription;
@@ -24,6 +25,7 @@ pub mod testutil;
 pub mod types;
 
 pub use client::IndexerClient;
+pub use endpoint::{IndexerCredential, IndexerEndpoint};
 pub use error::IndexerError;
 pub use subscription::{Subscription, SubscriptionClient};
 pub use types::*;

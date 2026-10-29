@@ -12,7 +12,7 @@ use midnight_helpers::{
     Timestamp, UnshieldedTokenType, UnshieldedWallet, Wallet as ContextWallet, WalletSeed,
     WalletState as ZswapLocalState,
 };
-use midnight_indexer_client::SubscriptionClient;
+use midnight_indexer_client::{IndexerEndpoint, SubscriptionClient};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -113,13 +113,13 @@ pub struct Wallet {
     ///
     /// The cursors are event counts, so they mean nothing against a different
     /// server: a replay resumed elsewhere would apply another indexer's events
-    /// to this state. Holding the URL here keeps every later replay on the
+    /// to this state. Holding the endpoint here keeps every later replay on the
     /// wallet's own indexer rather than one a consumer supplies.
     ///
     /// It binds nothing across a restart. The snapshot records no indexer
     /// identity, so `Wallet::sync(other_url, ..).with_storage(dir)` resumes
     /// these cursors against `other_url` and nothing notices.
-    indexer_url: String,
+    indexer: IndexerEndpoint,
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +528,7 @@ impl ResyncPlan {
     /// serialize resyncs themselves (two concurrent runs would replay from
     /// the same cursors and race their commits); the provider holds a
     /// dedicated resync mutex across plan → run → commit for this.
-    pub async fn run(self, indexer_url: &str) -> Result<ResyncCommit, WalletError> {
+    pub async fn run(self, indexer: &IndexerEndpoint) -> Result<ResyncCommit, WalletError> {
         let ResyncPlan {
             secret_keys,
             unshielded_address,
@@ -540,8 +540,8 @@ impl ResyncPlan {
             last_tx_id,
         } = self;
 
-        let sub_client = SubscriptionClient::new(indexer_url);
-        let indexer_client = midnight_indexer_client::IndexerClient::new(indexer_url)?;
+        let sub_client = SubscriptionClient::new(indexer);
+        let indexer_client = midnight_indexer_client::IndexerClient::new(indexer)?;
 
         let start_tx_id = last_tx_id.map(|id| id + 1).unwrap_or(0);
 
@@ -666,8 +666,8 @@ impl ShieldedRescanPlan {
     /// serialize this against resyncs (a resync committing its own cursor and
     /// state in the middle would overwrite the rebuilt state); the provider
     /// holds its resync mutex across plan → run → commit for this.
-    pub async fn run(self, indexer_url: &str) -> Result<ShieldedRescanCommit, WalletError> {
-        let sub_client = SubscriptionClient::new(indexer_url);
+    pub async fn run(self, indexer: &IndexerEndpoint) -> Result<ShieldedRescanCommit, WalletError> {
+        let sub_client = SubscriptionClient::new(indexer);
         let (zswap_state, zswap_event_id) = replay_zswap_events(
             &sub_client,
             &self.secret_keys,
@@ -738,9 +738,10 @@ impl Wallet {
     }
 
     /// The indexer this wallet synced from, and the only one its cursors
-    /// mean anything against.
-    pub fn indexer_url(&self) -> &str {
-        &self.indexer_url
+    /// mean anything against. The whole endpoint, credential included, so a
+    /// later replay reaches an indexer that requires one.
+    pub fn indexer_url(&self) -> &IndexerEndpoint {
+        &self.indexer
     }
 
     /// Move the pin to the block a fresh check saw, so it stays inside an
@@ -778,7 +779,7 @@ impl Wallet {
     }
 
     pub async fn sync_inner(
-        indexer_url: &str,
+        indexer: impl Into<IndexerEndpoint>,
         seed: WalletSeed,
         address: &str,
         network: impl Into<crate::Network>,
@@ -789,6 +790,7 @@ impl Wallet {
         chain_pin: Option<ChainPin>,
         progress: Option<mpsc::Sender<SyncProgress>>,
     ) -> Result<Self, WalletError> {
+        let indexer = &indexer.into();
         let network = network.into();
         let network_id: &str = network.as_str();
         let wallet_id = wallet_storage_id(address);
@@ -849,7 +851,7 @@ impl Wallet {
         let secret_keys = shielded.secret_keys().clone();
 
         info!("fetching latest block from indexer");
-        let indexer_client = midnight_indexer_client::IndexerClient::new(indexer_url)?;
+        let indexer_client = midnight_indexer_client::IndexerClient::new(indexer)?;
         let block = indexer_client
             .get_block(None)
             .await
@@ -864,7 +866,7 @@ impl Wallet {
             .ok_or_else(|| WalletError::Sync("latest block has no timestamp".into()))?;
 
         let network_id = network_id.to_string();
-        let sub_client = SubscriptionClient::new(indexer_url);
+        let sub_client = SubscriptionClient::new(indexer);
 
         // Extract starting state from cache or defaults.
         // When resuming, start from the next event after the last applied one
@@ -992,7 +994,7 @@ impl Wallet {
             block_context,
             pending,
             storage_dir: storage_dir.map(Path::to_path_buf),
-            indexer_url: indexer_url.to_string(),
+            indexer: indexer.clone(),
         };
 
         // Reservations made before a restart whose spends this replay just
@@ -1525,7 +1527,7 @@ impl Wallet {
     /// persistence failure surfaces as [`WalletError::Storage`] with the
     /// in-memory state already updated.
     ///
-    /// `indexer_url` is passed in by the caller (typically
+    /// `indexer` is passed in by the caller (typically
     /// `MidnightProvider::resync_wallet`) so the wallet
     /// itself stays free of network-endpoint state.
     ///
@@ -1536,8 +1538,8 @@ impl Wallet {
     /// lives behind a lock; lock-sharing callers should drive the three
     /// steps themselves and only hold the lock around the snapshot and the
     /// commit.
-    pub async fn resync(&mut self, indexer_url: &str) -> Result<(), WalletError> {
-        let commit = self.resync_plan().run(indexer_url).await?;
+    pub async fn resync(&mut self, indexer: impl Into<IndexerEndpoint>) -> Result<(), WalletError> {
+        let commit = self.resync_plan().run(&indexer.into()).await?;
         self.commit_resync(commit)
     }
 
@@ -1924,8 +1926,11 @@ impl Wallet {
     /// replay I/O; callers that share the wallet behind a lock should drive
     /// the three steps themselves, as `MidnightProvider::rescan_shielded`
     /// does.
-    pub async fn rescan_shielded(&mut self, indexer_url: &str) -> Result<(), WalletError> {
-        let commit = self.shielded_rescan_plan().run(indexer_url).await?;
+    pub async fn rescan_shielded(
+        &mut self,
+        indexer: impl Into<IndexerEndpoint>,
+    ) -> Result<(), WalletError> {
+        let commit = self.shielded_rescan_plan().run(&indexer.into()).await?;
         self.commit_shielded_rescan(commit)
     }
 
@@ -2861,7 +2866,7 @@ mod tests {
             block_context: None,
             pending: PendingReservations::default(),
             storage_dir,
-            indexer_url: "http://indexer.invalid".into(),
+            indexer: "http://indexer.invalid".into(),
         }
     }
 

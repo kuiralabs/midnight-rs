@@ -18,6 +18,7 @@
 
 use std::path::PathBuf;
 
+use midnight_indexer_client::IndexerEndpoint;
 use midnight_types::chain_pin::{ChainCheck, ChainPin, ChainView, current_pin, verify_pin};
 use midnight_types::{Network, WalletError, WalletSeed};
 use tokio::sync::mpsc;
@@ -38,12 +39,12 @@ impl Wallet {
     /// whether a progress sender is attached and whether the sync runs in the
     /// current task or a spawned one.
     pub fn sync<'a>(
-        indexer_url: impl Into<String>,
+        indexer: impl Into<IndexerEndpoint>,
         seed: impl Into<WalletSeed>,
         network: impl Into<Network>,
     ) -> WalletSyncBuilder<'a> {
         WalletSyncBuilder {
-            indexer_url: indexer_url.into(),
+            indexer: indexer.into(),
             seed: seed.into(),
             network: network.into(),
             storage_dir: None,
@@ -109,7 +110,7 @@ impl std::future::Future for SyncHandle {
 ///   returns `(receiver, handle)`. The receiver emits [`SyncProgress`] events;
 ///   the [`SyncHandle`] resolves to the synced wallet when sync completes.
 pub struct WalletSyncBuilder<'a> {
-    indexer_url: String,
+    indexer: IndexerEndpoint,
     seed: WalletSeed,
     network: Network,
     storage_dir: Option<PathBuf>,
@@ -119,7 +120,7 @@ pub struct WalletSyncBuilder<'a> {
 /// The owned inputs a sync runs on, once the chain work is done. Holding no
 /// borrow is what lets [`WalletSyncBuilder::stream`] spawn.
 struct SyncPlan {
-    indexer_url: String,
+    indexer: IndexerEndpoint,
     seed: WalletSeed,
     address: String,
     network: Network,
@@ -165,7 +166,7 @@ impl<'a> WalletSyncBuilder<'a> {
     /// fresh one.
     async fn prepare(self) -> Result<SyncPlan, WalletError> {
         let WalletSyncBuilder {
-            indexer_url,
+            indexer,
             seed,
             network,
             storage_dir,
@@ -209,7 +210,7 @@ impl<'a> WalletSyncBuilder<'a> {
         }
 
         Ok(SyncPlan {
-            indexer_url,
+            indexer,
             seed,
             address,
             network,
@@ -245,7 +246,7 @@ impl<'a> WalletSyncBuilder<'a> {
             // original is consumed by the sync itself.
             let receiver_gone = tx.clone();
             let sync = Wallet::sync_inner(
-                &plan.indexer_url,
+                &plan.indexer,
                 plan.seed,
                 &plan.address,
                 plan.network,
@@ -278,7 +279,7 @@ impl<'a> std::future::IntoFuture for WalletSyncBuilder<'a> {
         Box::pin(async move {
             let plan = self.prepare().await?;
             Wallet::sync_inner(
-                &plan.indexer_url,
+                &plan.indexer,
                 plan.seed,
                 &plan.address,
                 plan.network,

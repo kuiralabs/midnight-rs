@@ -17,7 +17,8 @@ use midnight_helpers::{
     ShieldedTokenType, UnshieldedTokenType,
 };
 use midnight_indexer_client::{
-    BlockOffset, ContractAction, ContractActionOffset, IndexerClient, TransactionOffset,
+    BlockOffset, ContractAction, ContractActionOffset, IndexerClient, IndexerEndpoint,
+    TransactionOffset,
 };
 use midnight_private_state::PrivateStateProvider;
 use midnight_types::{
@@ -49,7 +50,7 @@ struct NodeConnection {
 /// `OnlineClient` built on the same transport.
 pub struct MidnightProvider {
     indexer: IndexerClient,
-    indexer_url: String,
+    indexer_endpoint: IndexerEndpoint,
     node_url: String,
     /// The wallet, reached only through its API.
     ///
@@ -88,11 +89,16 @@ impl MidnightProvider {
     /// let wallet = Wallet::sync(provider.indexer_url(), seed, Network::Undeployed).await?;
     /// let provider = provider.with_wallet(LocalWallet::new(wallet));
     /// ```
-    pub fn new(node_url: &str, indexer_url: &str) -> Result<Self, ProviderError> {
-        let indexer = IndexerClient::new(indexer_url)?;
+    ///
+    /// `indexer` is a bare URL for the self-hosted Midnight indexer, or an
+    /// [`IndexerEndpoint`] for one laid out differently or requiring a
+    /// credential.
+    pub fn new(node_url: &str, indexer: impl Into<IndexerEndpoint>) -> Result<Self, ProviderError> {
+        let indexer_endpoint = indexer.into();
+        let indexer = IndexerClient::new(&indexer_endpoint)?;
         Ok(Self {
             indexer,
-            indexer_url: indexer_url.to_string(),
+            indexer_endpoint,
             node_url: node_url.to_string(),
             wallet: None,
             proof_provider: None,
@@ -177,10 +183,15 @@ impl MidnightProvider {
         self.private_state.clone()
     }
 
-    /// The indexer URL this provider was built with, for a caller syncing a
+    /// The indexer this provider was built with, for a caller syncing a
     /// wallet against the same indexer.
-    pub fn indexer_url(&self) -> &str {
-        &self.indexer_url
+    ///
+    /// The whole endpoint rather than a URL string: an indexer that requires a
+    /// credential would otherwise be reached without it by every
+    /// `Wallet::sync(provider.indexer_url(), ..)`, and answer 403 from inside
+    /// the sync.
+    pub fn indexer_url(&self) -> &IndexerEndpoint {
+        &self.indexer_endpoint
     }
 
     /// Attach a wallet, and become the single entry point for its resync,
