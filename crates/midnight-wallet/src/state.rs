@@ -221,6 +221,35 @@ const DUST_CHECKPOINT_INTERVAL: u64 = 50_000;
 
 type DustCheckpointFn = dyn Fn(&DustWallet<DefaultDB>, i64) + Send;
 
+/// Longest a replay loop goes without reporting progress. A consumer may keep
+/// the sync alive on it: iOS expires a continued-processing task that stops
+/// reporting for about 30 seconds, and 10,000 dust events take longer than that
+/// on a phone in the background.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Reports on the first applied event, then once per interval.
+struct ProgressPacer {
+    interval: std::time::Duration,
+    last: Option<std::time::Instant>,
+}
+
+impl ProgressPacer {
+    fn new(interval: std::time::Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+        }
+    }
+
+    fn due(&mut self, now: std::time::Instant) -> bool {
+        if matches!(self.last, Some(last) if now.duration_since(last) < self.interval) {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
 /// What a mid-sync checkpoint writes beside the dust wallet it is handed.
 ///
 /// Owned, because the checkpoint closure outlives the frame that builds it,
@@ -1995,6 +2024,7 @@ async fn replay_zswap_events(
     let mut state = initial_state;
     let mut last_id: i64 = last_applied_before(start_id);
     let mut count: u64 = 0;
+    let mut pacer = ProgressPacer::new(PROGRESS_INTERVAL);
     let mut retries: u32 = 0;
     // Semantic timeout, layered above the client's transport keepalive: the
     // client guarantees a dead socket errors out within its idle timeout
@@ -2078,6 +2108,8 @@ async fn replay_zswap_events(
                             max_id = msg.max_id,
                             "zswap replay progress"
                         );
+                    }
+                    if pacer.due(std::time::Instant::now()) {
                         let alive = send_progress(
                             &progress,
                             SyncProgress::ZswapEvents {
@@ -2165,6 +2197,7 @@ async fn replay_dust_events(
     // surfaced to the caller so it can clear confirmed pending reservations.
     let mut spend_nullifiers: Vec<DustNullifier> = Vec::new();
     let mut count: u64 = 0;
+    let mut pacer = ProgressPacer::new(PROGRESS_INTERVAL);
     let mut since_checkpoint: u64 = 0;
     let mut retries: u32 = 0;
     // Semantic timeout above the client's transport keepalive; see
@@ -2255,6 +2288,8 @@ async fn replay_dust_events(
                             max_id = msg.max_id,
                             "dust replay progress"
                         );
+                    }
+                    if pacer.due(std::time::Instant::now()) {
                         let alive = send_progress(
                             &progress,
                             SyncProgress::DustEvents {
@@ -3530,6 +3565,28 @@ mod tests {
 
         let remaining: Vec<_> = wallet.pending.unshielded_keys().cloned().collect();
         assert_eq!(remaining, vec![late], "late reservation must survive");
+    }
+
+    #[test]
+    fn progress_is_reported_on_the_first_event_then_once_per_interval() {
+        let interval = std::time::Duration::from_secs(1);
+        let start = std::time::Instant::now();
+        let mut pacer = ProgressPacer::new(interval);
+
+        assert!(pacer.due(start), "the first event must report at once");
+        assert!(
+            !pacer.due(start + interval / 2),
+            "reported again inside the interval"
+        );
+        assert!(
+            pacer.due(start + interval),
+            "a full interval passed without a report"
+        );
+        assert!(!pacer.due(start + interval + interval / 2));
+        assert!(
+            pacer.due(start + interval * 30),
+            "a slow event must still report once it lands"
+        );
     }
 
     #[test]

@@ -96,6 +96,50 @@ async fn sync_replays_events() {
     );
 }
 
+/// A consumer that keeps the sync alive on progress — iOS expires a background
+/// task that stops reporting — must hear from each replay before it finishes,
+/// however few events the chain has.
+#[tokio::test]
+async fn each_replay_reports_progress_before_it_completes() {
+    use midnight_wallet::SyncProgress;
+
+    let (node, indexer) = require_devnet!();
+    let provider = MidnightProvider::new(&node, &indexer).expect("provider construction");
+    let (mut rx, handle) = Wallet::sync(
+        provider.indexer_url(),
+        dev_seed(),
+        midnight_wallet::Network::Undeployed,
+    )
+    .stream()
+    .await
+    .expect("sync starts");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    handle.await.expect("indexer sync should succeed");
+
+    let position = |pred: &dyn Fn(&SyncProgress) -> bool| events.iter().position(pred);
+    let zswap_complete =
+        position(&|e| matches!(e, SyncProgress::ZswapComplete { events } if *events > 0))
+            .expect("the zswap replay completes having applied events");
+    let dust_complete =
+        position(&|e| matches!(e, SyncProgress::DustComplete { events } if *events > 0))
+            .expect("the dust replay completes having applied events");
+    let zswap_progress = position(&|e| matches!(e, SyncProgress::ZswapEvents { .. }));
+    let dust_progress = position(&|e| matches!(e, SyncProgress::DustEvents { .. }));
+
+    assert!(
+        zswap_progress.is_some_and(|i| i < zswap_complete),
+        "the zswap replay finished without reporting progress: {events:?}"
+    );
+    assert!(
+        dust_progress.is_some_and(|i| i < dust_complete),
+        "the dust replay finished without reporting progress: {events:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Build context from indexed state via the provider
 // ---------------------------------------------------------------------------
