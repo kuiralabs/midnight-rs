@@ -140,6 +140,80 @@ async fn each_replay_reports_progress_before_it_completes() {
     );
 }
 
+/// The Settings "re-sync" a person reaches for when a balance looks wrong. Through the provider,
+/// as an app calls it, it must replay the chain from its first event rather than resume from the
+/// cursors it was asked to discard, and it must say so as it goes.
+#[tokio::test]
+async fn a_genesis_rebuild_replays_the_chain_and_reports_it() {
+    use std::sync::{Arc, Mutex};
+
+    use midnight_wallet::SyncProgress;
+
+    fn applied(events: &[SyncProgress]) -> (Option<u64>, Option<u64>) {
+        let zswap = events.iter().find_map(|e| match e {
+            SyncProgress::ZswapComplete { events } => Some(*events),
+            _ => None,
+        });
+        let dust = events.iter().find_map(|e| match e {
+            SyncProgress::DustComplete { events } => Some(*events),
+            _ => None,
+        });
+        (zswap, dust)
+    }
+
+    let (node, indexer) = require_devnet!();
+    let provider = MidnightProvider::new(&node, &indexer).expect("provider construction");
+    let (mut rx, handle) = Wallet::sync(
+        provider.indexer_url(),
+        dev_seed(),
+        midnight_wallet::Network::Undeployed,
+    )
+    .stream()
+    .await
+    .expect("sync starts");
+    let mut first_sync = Vec::new();
+    while let Some(event) = rx.recv().await {
+        first_sync.push(event);
+    }
+    let wallet = handle.await.expect("indexer sync should succeed");
+    let (synced_zswap, synced_dust) = applied(&first_sync);
+    let (synced_zswap, synced_dust) = (
+        synced_zswap.expect("the first sync replays zswap"),
+        synced_dust.expect("the first sync replays dust"),
+    );
+    let provider = provider.with_wallet(LocalWallet::new(wallet));
+    let before = provider.sync_cursors().await.expect("attached");
+
+    let rebuild = Arc::new(Mutex::new(Vec::new()));
+    let sink = rebuild.clone();
+    provider
+        .resync_wallet_from_genesis(Some(Arc::new(move |update| {
+            sink.lock().unwrap().push(update);
+        })))
+        .await
+        .expect("the rebuild should succeed");
+
+    // The chain only grows, so a replay from its first event applies at least what the first
+    // sync did. A rebuild that resumed from the cursors instead applies nothing.
+    let rebuild = rebuild.lock().unwrap().clone();
+    let (zswap, dust) = applied(&rebuild);
+    assert!(
+        zswap.is_some_and(|n| n >= synced_zswap),
+        "the rebuild must replay the {synced_zswap} zswap events the first sync did, reported {zswap:?}: {rebuild:?}"
+    );
+    assert!(
+        dust.is_some_and(|n| n >= synced_dust),
+        "the rebuild must replay the {synced_dust} dust events the first sync did, reported {dust:?}: {rebuild:?}"
+    );
+
+    let after = provider.sync_cursors().await.expect("attached");
+    assert!(
+        after.zswap_event_id >= before.zswap_event_id
+            && after.dust_event_id >= before.dust_event_id,
+        "a rebuild must land at the tip, not behind where it started: before {before:?}, after {after:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Build context from indexed state via the provider
 // ---------------------------------------------------------------------------

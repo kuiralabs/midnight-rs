@@ -18,36 +18,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::chain_pin::ChainPin;
-pub use midnight_types::{SyncCursors, TrackedUtxo};
+pub use midnight_types::{ProgressSink, SyncCursors, SyncProgress, TrackedUtxo};
 
 use crate::pending::PendingReservations;
 use crate::{SpentUtxoKey, WalletError};
-
-/// Progress updates emitted during wallet sync.
-#[derive(Debug, Clone)]
-pub enum SyncProgress {
-    Resuming {
-        zswap_event_id: i64,
-        dust_event_id: i64,
-    },
-    ZswapEvents {
-        current: i64,
-        max: i64,
-    },
-    ZswapComplete {
-        events: u64,
-    },
-    DustEvents {
-        current: i64,
-        max: i64,
-    },
-    DustComplete {
-        events: u64,
-    },
-    UnshieldedCaughtUp {
-        utxos: usize,
-    },
-}
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -610,6 +584,22 @@ pub struct ResyncPlan {
     zswap_event_id: i64,
     unshielded_utxos: Vec<TrackedUtxo>,
     last_tx_id: Option<i64>,
+    /// Whether the cursors continue a state the wallet already holds. A resume reads an indexer
+    /// with nothing to send as "already at tip"; a rebuild from genesis must read the same
+    /// silence as a stall, or it commits the empty state it started from.
+    resuming: bool,
+}
+
+/// What a resync's three replays produced, before the latest block is fetched.
+struct Replayed {
+    dust: (
+        DustWallet<DefaultDB>,
+        i64,
+        Option<Timestamp>,
+        Vec<DustNullifier>,
+    ),
+    zswap: (ZswapLocalState<DefaultDB>, i64),
+    unshielded: (Vec<TrackedUtxo>, i64, i64, Vec<SpentUtxoKey>),
 }
 
 impl ResyncPlan {
@@ -627,61 +617,32 @@ impl ResyncPlan {
     /// the same cursors and race their commits); the provider holds a
     /// dedicated resync mutex across plan → run → commit for this.
     pub async fn run(self, indexer: &IndexerEndpoint) -> Result<ResyncCommit, WalletError> {
-        let ResyncPlan {
-            secret_keys,
-            unshielded_address,
-            dust_wallet,
-            dust_event_id,
-            zswap_state,
-            zswap_event_id,
-            unshielded_utxos,
-            last_tx_id,
-        } = self;
+        self.run_reporting(indexer, None).await
+    }
 
+    /// [`Self::run`], reporting each replay's [`SyncProgress`] to `progress` as the first sync
+    /// does. A rebuild from genesis replays the whole chain, which on a long one is minutes, and
+    /// a caller has nothing to show for that time without it.
+    pub async fn run_reporting(
+        self,
+        indexer: &IndexerEndpoint,
+        progress: Option<mpsc::Sender<SyncProgress>>,
+    ) -> Result<ResyncCommit, WalletError> {
         let sub_client = SubscriptionClient::new(indexer);
         let indexer_client = midnight_indexer_client::IndexerClient::new(indexer)?;
 
-        let start_tx_id = last_tx_id.map(|id| id + 1).unwrap_or(0);
-
-        let (dust_res, zswap_res, unshielded_res, block_res) = tokio::join!(
-            replay_dust_events(
-                &sub_client,
-                dust_wallet,
-                dust_event_id + 1,
-                true,
-                None::<fn(&DustWallet<DefaultDB>, i64)>,
-                DUST_CHECKPOINT_INTERVAL,
-                None,
-            ),
-            replay_zswap_events(
-                &sub_client,
-                &secret_keys,
-                zswap_state,
-                zswap_event_id + 1,
-                true,
-                None,
-            ),
-            replay_unshielded_events(
-                &sub_client,
-                &unshielded_address,
-                unshielded_utxos,
-                start_tx_id,
-                // A resume, like the two replays above: the wallet already
-                // holds a cursor, so a stream with nothing to deliver means
-                // this address is at the tip. An address with no new
-                // transactions is the ordinary case, and reading its silence
-                // as a failure ends the resync.
-                true,
-                None,
-            ),
+        let (replayed, block_res) = tokio::join!(
+            self.replay(&sub_client, progress),
             indexer_client.get_block(None),
         );
 
         // Await every result before returning. If any task failed, no commit
         // is produced and the source wallet stays as it was.
-        let (dust_wallet, dust_event_id, last_dust_block_time, dust_nullifiers) = dust_res?;
-        let (zswap_state, zswap_event_id) = zswap_res?;
-        let (unshielded_utxos, last_tx_id, last_block_height, spent_unshielded) = unshielded_res?;
+        let Replayed {
+            dust: (dust_wallet, dust_event_id, last_dust_block_time, dust_nullifiers),
+            zswap: (zswap_state, zswap_event_id),
+            unshielded: (unshielded_utxos, last_tx_id, last_block_height, spent_unshielded),
+        } = replayed?;
         let block = block_res
             .map_err(|e| WalletError::Sync(format!("fetch latest block: {e}")))?
             .ok_or_else(|| WalletError::Sync("no blocks available from indexer".into()))?;
@@ -704,6 +665,64 @@ impl ResyncPlan {
             spent_unshielded,
             chain_tblock,
             parameters,
+        })
+    }
+
+    async fn replay(
+        self,
+        sub_client: &SubscriptionClient,
+        progress: Option<mpsc::Sender<SyncProgress>>,
+    ) -> Result<Replayed, WalletError> {
+        let ResyncPlan {
+            secret_keys,
+            unshielded_address,
+            dust_wallet,
+            dust_event_id,
+            zswap_state,
+            zswap_event_id,
+            unshielded_utxos,
+            last_tx_id,
+            resuming,
+        } = self;
+
+        let start_tx_id = last_tx_id.map(|id| id + 1).unwrap_or(0);
+
+        // The first replay to fail ends the others: the result is discarded either way, and a
+        // stalled stream should not be waited out a second and third time.
+        let (dust, zswap, unshielded) = tokio::try_join!(
+            replay_dust_events(
+                sub_client,
+                dust_wallet,
+                dust_event_id + 1,
+                resuming,
+                None::<fn(&DustWallet<DefaultDB>, i64)>,
+                DUST_CHECKPOINT_INTERVAL,
+                progress.clone(),
+            ),
+            replay_zswap_events(
+                sub_client,
+                &secret_keys,
+                zswap_state,
+                zswap_event_id + 1,
+                resuming,
+                progress.clone(),
+            ),
+            // On a resume the wallet already holds a cursor, so a stream with nothing to deliver
+            // means this address is at the tip. An address with no new transactions is the
+            // ordinary case, and reading its silence as a failure ends the resync.
+            replay_unshielded_events(
+                sub_client,
+                &unshielded_address,
+                unshielded_utxos,
+                start_tx_id,
+                resuming,
+                progress,
+            ),
+        )?;
+        Ok(Replayed {
+            dust,
+            zswap,
+            unshielded,
         })
     }
 }
@@ -1655,6 +1674,7 @@ impl Wallet {
             zswap_event_id: self.zswap_event_id,
             unshielded_utxos: self.unshielded_utxos.clone(),
             last_tx_id: self.last_tx_id,
+            resuming: true,
         }
     }
 
@@ -1682,6 +1702,7 @@ impl Wallet {
             zswap_event_id: -1,
             unshielded_utxos: Vec::new(),
             last_tx_id: None,
+            resuming: false,
         }
     }
 
@@ -4407,6 +4428,65 @@ mod tests {
     /// The replay loops hand the ledger a batch of events per call. Batching must change how fast
     /// the trees are rehashed and nothing else: these drive the real loops over a mock indexer and
     /// compare the result, byte for byte, with the same events applied one call at a time.
+    mod genesis_resync_ws {
+        use midnight_indexer_client::testutil::{bind, next_json, send_json, subscriber_handshake};
+        use serde_json::json;
+
+        use super::*;
+
+        /// An indexer that takes every subscription and sends no events on it, while still
+        /// answering keepalives: alive, but with nothing to say.
+        async fn silent_indexer() -> String {
+            let (listener, url) = bind().await;
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let (mut ws, _) = subscriber_handshake(stream).await;
+                        while let Some(message) = next_json(&mut ws).await {
+                            if message["type"] == "ping" {
+                                send_json(&mut ws, &json!({"type": "pong"})).await;
+                            }
+                        }
+                    });
+                }
+            });
+            url
+        }
+
+        #[tokio::test]
+        async fn a_genesis_rebuild_reads_a_silent_indexer_as_a_stall_not_the_tip() {
+            let url = silent_indexer().await;
+            let plan = test_wallet(None).resync_plan_from_genesis();
+
+            let replayed = plan.replay(&SubscriptionClient::new(&url), None).await;
+
+            match replayed {
+                Err(WalletError::Sync(message)) => assert!(
+                    message.contains("timeout waiting"),
+                    "expected the replay to give up on the silence, got: {message}"
+                ),
+                Err(other) => panic!("expected a stall, got: {other:?}"),
+                Ok(_) => panic!(
+                    "a rebuild that reads silence as the tip commits the empty state it started from"
+                ),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_delta_resync_reads_a_silent_indexer_as_the_tip() {
+            let url = silent_indexer().await;
+            let plan = test_wallet(None).resync_plan();
+
+            let replayed = plan
+                .replay(&SubscriptionClient::new(&url), None)
+                .await
+                .expect("a resume with nothing new is at the tip");
+
+            assert_eq!(replayed.zswap.1, 0, "the zswap cursor must not move");
+            assert_eq!(replayed.dust.1, 0, "the dust cursor must not move");
+        }
+    }
+
     mod batched_replay_ws {
         use std::sync::Mutex;
 

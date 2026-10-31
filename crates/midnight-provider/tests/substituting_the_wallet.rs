@@ -18,8 +18,9 @@ use midnight_helpers::{
     ProofProvider, WalletSeed,
 };
 use midnight_provider::{
-    MidnightProvider, Network, ReservedBuild, SpendableShieldedCoin, SpentInputs, SyncCursors,
-    TrackedUtxo, TransferRequest, WalletBalance, WalletError, WalletFacade,
+    MidnightProvider, Network, ProgressSink, ReservedBuild, SpendableShieldedCoin, SpentInputs,
+    SyncCursors, SyncProgress, TrackedUtxo, TransferRequest, WalletBalance, WalletError,
+    WalletFacade,
 };
 use midnight_wallet::chain_pin::ChainView;
 
@@ -122,8 +123,15 @@ impl WalletFacade for StubWallet {
         Ok(())
     }
 
-    async fn resync_from_genesis(&self, _chain: &dyn ChainView) -> Result<(), WalletError> {
+    async fn resync_from_genesis(
+        &self,
+        _chain: &dyn ChainView,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), WalletError> {
         self.resyncs.lock().unwrap().push("genesis");
+        if let Some(report) = progress {
+            report(SyncProgress::ZswapComplete { events: 7 });
+        }
         Ok(())
     }
 
@@ -169,8 +177,12 @@ async fn a_genesis_resync_reaches_the_wallets_genesis_rebuild() {
         .expect("provider")
         .with_wallet(wallet);
 
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let sink = reported.clone();
     provider
-        .resync_wallet_from_genesis()
+        .resync_wallet_from_genesis(Some(Arc::new(move |update| {
+            sink.lock().unwrap().push(format!("{update:?}"));
+        })))
         .await
         .expect("the stub resyncs without a chain");
 
@@ -178,5 +190,10 @@ async fn a_genesis_resync_reaches_the_wallets_genesis_rebuild() {
         *resyncs.lock().unwrap(),
         vec!["genesis"],
         "a genesis resync that lands on the delta resync replays nothing and leaves the state it was asked to rebuild"
+    );
+    assert_eq!(
+        *reported.lock().unwrap(),
+        vec!["ZswapComplete { events: 7 }"],
+        "the rebuild's progress must reach the caller that asked for it"
     );
 }

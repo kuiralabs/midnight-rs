@@ -23,8 +23,8 @@ use midnight_helpers::{
 };
 use midnight_types::chain_pin::ChainView;
 use midnight_types::{
-    CoinInfo, Network, PreparedTransfer, SpendableShieldedCoin, SpentInputs, SyncCursors,
-    TrackedUtxo, TransferRequest, WalletBalance, WalletError, WalletSeed,
+    CoinInfo, Network, PreparedTransfer, ProgressSink, SpendableShieldedCoin, SpentInputs,
+    SyncCursors, TrackedUtxo, TransferRequest, WalletBalance, WalletError, WalletSeed,
 };
 
 /// A prepared build whose inputs the wallet already holds.
@@ -205,9 +205,17 @@ pub trait WalletFacade: Send + Sync {
     /// Unlike [`Self::resync`], a replaced chain is not an error here: that is the condition this
     /// call exists to recover from.
     ///
+    /// `progress` receives the replay's progress as the first sync reports it: the rebuild covers
+    /// the whole chain, and a caller has nothing else to show for that time.
+    ///
     /// Defaults to [`Self::resync`] so an implementation with no cheaper rebuild than its ordinary
     /// resync — a test double, or a wallet that never caches — stays correct without writing one.
-    async fn resync_from_genesis(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
+    async fn resync_from_genesis(
+        &self,
+        chain: &dyn ChainView,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), WalletError> {
+        let _ = progress;
         self.resync(chain).await
     }
 
@@ -321,8 +329,12 @@ impl<T: WalletFacade + ?Sized> WalletFacade for Arc<T> {
         (**self).resync(chain).await
     }
 
-    async fn resync_from_genesis(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
-        (**self).resync_from_genesis(chain).await
+    async fn resync_from_genesis(
+        &self,
+        chain: &dyn ChainView,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), WalletError> {
+        (**self).resync_from_genesis(chain, progress).await
     }
 
     async fn rescan_shielded(&self) -> Result<(), WalletError> {

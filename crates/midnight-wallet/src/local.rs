@@ -10,11 +10,11 @@ use midnight_helpers::{
 };
 use midnight_types::chain_pin::{ChainCheck, ChainView, current_pin, verify_pin};
 use midnight_types::{
-    Network, SpendableShieldedCoin, SpentInputs, SyncCursors, TrackedUtxo, TransferRequest,
-    WalletBalance, WalletError,
+    Network, ProgressSink, SpendableShieldedCoin, SpentInputs, SyncCursors, TrackedUtxo,
+    TransferRequest, WalletBalance, WalletError,
 };
 use midnight_wallet_facade::{ReservedBuild, WalletFacade};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tracing::warn;
 
 use crate::state::Wallet;
@@ -61,6 +61,7 @@ impl LocalWallet {
         &self,
         chain: &dyn ChainView,
         depth: ResyncDepth,
+        progress: Option<ProgressSink>,
     ) -> Result<(), WalletError> {
         let (pin, snapshot, indexer) = {
             let wallet = self.inner.read().await;
@@ -116,7 +117,21 @@ impl LocalWallet {
             ResyncDepth::Delta => self.inner.read().await.resync_plan(),
             ResyncDepth::Genesis => self.inner.read().await.resync_plan_from_genesis(),
         };
-        let commit = plan.run(&indexer).await?;
+        let commit = match progress {
+            None => plan.run(&indexer).await?,
+            // The replays report into a channel; drain it alongside them. The drain ends when the
+            // replay drops its sender, which it does on return, so the join cannot hang.
+            Some(sink) => {
+                let (tx, mut rx) = mpsc::channel(64);
+                let drain = async {
+                    while let Some(update) = rx.recv().await {
+                        sink(update);
+                    }
+                };
+                let (commit, ()) = tokio::join!(plan.run_reporting(&indexer, Some(tx)), drain);
+                commit?
+            }
+        };
         self.inner.write().await.commit_resync(commit)?;
 
         // Move the pin forward with the commit, so a wallet that runs for a
@@ -283,15 +298,20 @@ impl WalletFacade for LocalWallet {
     }
 
     async fn resync(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
-        self.resync_with(chain, ResyncDepth::Delta).await
+        self.resync_with(chain, ResyncDepth::Delta, None).await
     }
 
     /// Rebuild every cursor from genesis, discarding the cached state rather than extending
     /// it. The last resort when a delta resync cannot clear a locally-corrupt root — and the
     /// in-process equivalent of deleting the snapshot directory, which a running wallet
     /// holding that directory open cannot do to itself.
-    async fn resync_from_genesis(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
-        self.resync_with(chain, ResyncDepth::Genesis).await
+    async fn resync_from_genesis(
+        &self,
+        chain: &dyn ChainView,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), WalletError> {
+        self.resync_with(chain, ResyncDepth::Genesis, progress)
+            .await
     }
 
     async fn rescan_shielded(&self) -> Result<(), WalletError> {

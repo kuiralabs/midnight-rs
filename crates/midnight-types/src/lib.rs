@@ -30,7 +30,7 @@ pub use error::WalletError;
 pub use midnight_helpers::{CoinInfo, CoinSelectionStrategy, WalletSeed};
 pub use network::Network;
 pub use prepared_input::PreparedInput;
-pub use sync::{SyncCursors, TrackedUtxo, parse_intent_hash_hex};
+pub use sync::{ProgressSink, SyncCursors, SyncProgress, TrackedUtxo, parse_intent_hash_hex};
 pub use transfer::{
     BuildInputs, DustSpendBatch, PreparedTransfer, SpentInputs, SpentUtxoKey, TransferBuilder,
     TransferKind, TransferRequest, TransferResult, panic_message, parse_shielded_recipient,

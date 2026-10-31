@@ -87,3 +87,34 @@ pub fn parse_intent_hash_hex(hex: &str) -> Option<midnight_helpers::IntentHash> 
         arr,
     )))
 }
+
+/// Progress updates emitted during wallet sync.
+#[derive(Debug, Clone)]
+pub enum SyncProgress {
+    Resuming {
+        zswap_event_id: i64,
+        dust_event_id: i64,
+    },
+    ZswapEvents {
+        current: i64,
+        max: i64,
+    },
+    ZswapComplete {
+        events: u64,
+    },
+    DustEvents {
+        current: i64,
+        max: i64,
+    },
+    DustComplete {
+        events: u64,
+    },
+    UnshieldedCaughtUp {
+        utxos: usize,
+    },
+}
+/// Where a long-running replay reports its [`SyncProgress`].
+///
+/// A plain callback rather than a channel, so a trait that hands one over
+/// does not tie its implementations to an async runtime.
+pub type ProgressSink = std::sync::Arc<dyn Fn(SyncProgress) + Send + Sync>;
