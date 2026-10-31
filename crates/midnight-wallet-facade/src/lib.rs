@@ -321,6 +321,10 @@ impl<T: WalletFacade + ?Sized> WalletFacade for Arc<T> {
         (**self).resync(chain).await
     }
 
+    async fn resync_from_genesis(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
+        (**self).resync_from_genesis(chain).await
+    }
+
     async fn rescan_shielded(&self) -> Result<(), WalletError> {
         (**self).rescan_shielded().await
     }
