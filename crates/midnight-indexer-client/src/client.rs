@@ -3,13 +3,17 @@ use std::time::Duration;
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::{debug, warn};
 
+use crate::endpoint::IndexerEndpoint;
 use crate::error::IndexerError;
 use crate::queries;
 use crate::types::*;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-const GRAPHQL_PATH: &str = "/api/v3/graphql";
+/// The self-hosted indexer's GraphQL path under a base URL. A caller that
+/// names `/api/v3/graphql` itself still gets it: that path is an alias of v4,
+/// and rewriting a URL a caller chose is worse than serving it.
+const GRAPHQL_PATH: &str = "/api/v4/graphql";
 
 /// The most bytes of an undecodable response body that the warning logs.
 const LOGGED_BODY_BYTES: usize = 512;
@@ -33,30 +37,38 @@ pub(crate) fn graphql_url(base: &str) -> String {
 
 pub struct IndexerClient {
     http: reqwest::Client,
-    http_url: String,
+    endpoint: IndexerEndpoint,
 }
 
 impl IndexerClient {
     /// Create a new client.
     ///
-    /// `base_url` is the base indexer URL (e.g. `http://127.0.0.1:8088`), or
-    /// a URL whose path ends in `/graphql` or `/graphql/ws`. The client sends
-    /// queries to that `/graphql` path, or to `/api/v3/graphql` under a base
-    /// URL. Returns an error if the HTTP client cannot be built.
-    pub fn new(base_url: &str) -> Result<Self, IndexerError> {
-        let http_url = graphql_url(base_url);
+    /// A bare URL takes the self-hosted indexer's layout (see
+    /// [`IndexerEndpoint::from_base`]): the base indexer URL (e.g.
+    /// `http://127.0.0.1:8088`), or a URL whose path ends in `/graphql` or
+    /// `/graphql/ws`. The client sends queries to that `/graphql` path, or to
+    /// `/api/v4/graphql` under a base URL. An [`IndexerEndpoint`] is used as
+    /// given, and its credential is sent as a header on every query. Returns
+    /// an error if the HTTP client cannot be built.
+    pub fn new(endpoint: impl Into<IndexerEndpoint>) -> Result<Self, IndexerError> {
+        let endpoint = endpoint.into();
 
         let http = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
             .build()
             .map_err(|e| IndexerError::Config(e.to_string()))?;
 
-        Ok(Self { http, http_url })
+        Ok(Self { http, endpoint })
     }
 
-    /// URL the client is connected to.
+    /// URL the client posts GraphQL to.
     pub fn url(&self) -> &str {
-        &self.http_url
+        self.endpoint.graphql_url()
+    }
+
+    /// The endpoint this client was built for.
+    pub fn endpoint(&self) -> &IndexerEndpoint {
+        &self.endpoint
     }
 
     async fn execute<V: Serialize, R: DeserializeOwned>(
@@ -69,15 +81,13 @@ impl IndexerClient {
             "variables": variables,
         });
 
-        debug!(url = %self.http_url, "executing indexer GraphQL query");
+        debug!(url = %self.url(), "executing indexer GraphQL query");
 
-        let resp = self
-            .http
-            .post(&self.http_url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let mut request = self.http.post(self.url()).json(&body);
+        if let Some(credential) = self.endpoint.credential() {
+            request = request.header(credential.header(), credential.value());
+        }
+        let resp = request.send().await?.error_for_status()?;
 
         let text = resp.text().await?;
 
@@ -111,19 +121,25 @@ mod tests {
     #[test]
     fn url_construction_bare_host() {
         let client = IndexerClient::new("http://localhost:8088").unwrap();
-        assert_eq!(client.url(), "http://localhost:8088/api/v3/graphql");
+        assert_eq!(client.url(), "http://localhost:8088/api/v4/graphql");
     }
 
     #[test]
     fn url_construction_with_trailing_slash() {
         let client = IndexerClient::new("http://localhost:8088/").unwrap();
-        assert_eq!(client.url(), "http://localhost:8088/api/v3/graphql");
+        assert_eq!(client.url(), "http://localhost:8088/api/v4/graphql");
     }
 
     #[test]
     fn url_construction_full_path() {
         let client = IndexerClient::new("http://localhost:8088/api/v3/graphql").unwrap();
         assert_eq!(client.url(), "http://localhost:8088/api/v3/graphql");
+    }
+
+    #[test]
+    fn url_construction_full_v4_path() {
+        let client = IndexerClient::new("http://localhost:8088/api/v4/graphql").unwrap();
+        assert_eq!(client.url(), "http://localhost:8088/api/v4/graphql");
     }
 
     #[test]
@@ -134,7 +150,7 @@ mod tests {
         );
         assert_eq!(
             graphql_url("http://localhost:8088/foo/ws"),
-            "http://localhost:8088/foo/ws/api/v3/graphql"
+            "http://localhost:8088/foo/ws/api/v4/graphql"
         );
     }
 }

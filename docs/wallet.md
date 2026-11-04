@@ -164,7 +164,20 @@ A `WalletBuilder` holds no connection and does no work until a sync step runs. `
 
 Dust sync from genesis can take 30+ minutes on a mainnet-sized history. Progress is checkpointed to disk after each batch when `with_storage(...)` is set, so subsequent runs resume from the last cursor.
 
-The wallet keeps `indexer_url` for its later resyncs. The provider is the sync's source: its node reports the network and pins the wallet to the chain. The source can be anything that implements `SyncSource`, the trait in `midnight-types` that adds the node's network to the two-query `ChainView`.
+`indexer_url` is the base URL of a self-hosted Midnight indexer, such as `http://localhost:8088`, or the full URL of its GraphQL or subscription endpoint. A base URL gains `/api/v4/graphql` and `/api/v4/graphql/ws`. An indexer laid out differently, or one that requires a credential, takes an `IndexerEndpoint` in its place: `IndexerEndpoint::new(graphql_url, ws_url, credential)` uses both URLs exactly as given, and an `IndexerCredential` is sent as a request header on every query and on the subscription's WebSocket upgrade, never in a URL. The `Debug` and `Display` of either print the header name and never the value.
+
+```rust
+use midnight_core::{IndexerCredential, IndexerEndpoint};
+
+let indexer = IndexerEndpoint::new(
+    "https://midnight-preprod.blockfrost.io/api/v0",
+    "wss://midnight-preprod.blockfrost.io/api/v0/ws",
+    Some(IndexerCredential::new("project_id", project_id)),
+);
+let wallet = Wallet::from_mnemonic(phrase)?.sync(&provider, indexer).await?;
+```
+
+The wallet keeps the indexer, credential included, for its later resyncs. The provider is the sync's source: its node reports the network and pins the wallet to the chain. The source can be anything that implements `SyncSource`, the trait in `midnight-types` that adds the node's network to the two-query `ChainView`.
 
 Before the replay, the sync asks the node which network it runs. Without `.with_network(..)`, the wallet takes that network. The sync then fails with `WalletError::NetworkUnknown` when the node cannot answer, reports no network, or reports an id that the parse of a `Network` refuses (see [Address derivation](#address-derivation)).
 

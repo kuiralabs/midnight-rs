@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use midnight_helpers::DefaultDB;
-use midnight_indexer_client::SubscriptionClient;
+use midnight_indexer_client::{IndexerEndpoint, SubscriptionClient};
 use midnight_types::chain_pin::ChainPin;
 use midnight_types::hd::Seed;
 use midnight_types::{
@@ -119,7 +119,7 @@ impl Wallet {
         progress: Option<mpsc::Sender<SyncProgress>>,
     ) -> Result<Self, WalletError> {
         let sync = ChainSync {
-            indexer_url: &plan.indexer_url,
+            indexer: &plan.indexer,
             seed: &plan.seed,
             address: &plan.address,
             network: &plan.network,
@@ -355,7 +355,7 @@ impl Wallet {
             State::Ledger9(w) => ResyncPlanKind::Ledger9(w.resync_plan()),
         };
         ResyncPlan {
-            indexer_url: each!(&self.state, w => w.indexer_url()).to_string(),
+            indexer: each!(&self.state, w => w.indexer()).clone(),
             kind,
         }
     }
@@ -436,7 +436,7 @@ impl Wallet {
             ),
         };
         ShieldedRescanPlan {
-            indexer_url: each!(&self.state, w => w.indexer_url()).to_string(),
+            indexer: each!(&self.state, w => w.indexer()).clone(),
             seed: self.seed.clone(),
             coins,
             plan,
@@ -488,7 +488,7 @@ impl Wallet {
 /// plan does not mutate or lock anything beyond the `&self` borrow.
 #[must_use = "run the plan with ResyncPlan::run, then apply it with Wallet::commit_resync"]
 pub(crate) struct ResyncPlan {
-    indexer_url: String,
+    indexer: IndexerEndpoint,
     kind: ResyncPlanKind,
 }
 
@@ -531,30 +531,30 @@ impl ResyncPlan {
     /// Dust stream into an empty state of the later generation. It writes
     /// nothing, and the commit saves the crossed state.
     pub(crate) async fn run(self) -> Result<ResyncCommit, WalletError> {
-        let ResyncPlan { indexer_url, kind } = self;
-        let indexer_url = indexer_url.as_str();
+        let ResyncPlan { indexer, kind } = self;
+        let indexer = &indexer;
         match kind {
             ResyncPlanKind::Ledger9(plan) => Ok(ResyncCommit(ResyncCommitKind::Ledger9(
-                plan.run(indexer_url).await?,
+                plan.run(indexer).await?,
             ))),
             ResyncPlanKind::Ledger8 { plan, identity } => {
-                let block = latest_block(indexer_url).await?;
+                let block = latest_block(indexer).await?;
                 let block = if ledger_of(&block)? == LedgerVersion::V8 {
                     // The chain can fork before this replay ends, and the
                     // replay then meets the later generation's events.
-                    match plan.clone().run(indexer_url).await {
+                    match plan.clone().run(indexer).await {
                         Err(WalletError::LedgerMismatch { expected, found })
                             if found > expected =>
                         {
                             info!(%found, "the chain crossed a hard fork during the resync");
-                            latest_block(indexer_url).await?
+                            latest_block(indexer).await?
                         }
                         result => return Ok(ResyncCommit(ResyncCommitKind::Ledger8(result?))),
                     }
                 } else {
                     block
                 };
-                cross(plan, identity, &block, indexer_url).await
+                cross(plan, identity, &block, indexer).await
             }
         }
     }
@@ -566,7 +566,7 @@ async fn cross(
     plan: ledger_8::ResyncPlan,
     identity: WalletIdentity,
     block: &midnight_indexer_client::Block,
-    indexer_url: &str,
+    indexer: &IndexerEndpoint,
 ) -> Result<ResyncCommit, WalletError> {
     let ledger_8::ResyncPlan {
         unshielded_address,
@@ -590,7 +590,7 @@ async fn cross(
     };
     let state = sync_on_chain(
         ChainSync {
-            indexer_url,
+            indexer,
             seed: &identity.seed,
             address: &unshielded_address,
             network: &identity.network,
@@ -647,7 +647,7 @@ enum ResyncCommitKind {
 /// applies the result under a brief write lock.
 #[must_use = "run the plan with ShieldedRescanPlan::run, then apply it with Wallet::commit_shielded_rescan"]
 pub(crate) struct ShieldedRescanPlan {
-    indexer_url: String,
+    indexer: IndexerEndpoint,
     seed: Seed,
     coins: Vec<CoinInfo>,
     plan: RescanPlanKind,
@@ -678,25 +678,21 @@ impl ShieldedRescanPlan {
     /// way.
     pub(crate) async fn run(self) -> Result<ShieldedRescanCommit, WalletError> {
         let ShieldedRescanPlan {
-            indexer_url,
+            indexer,
             seed,
             coins,
             plan,
         } = self;
-        let indexer_url = indexer_url.as_str();
+        let indexer = &indexer;
         let result = match plan {
-            RescanPlanKind::Ledger8(plan) => {
-                plan.run(indexer_url).await.map(RescanCommitKind::Ledger8)
-            }
-            RescanPlanKind::Ledger9(plan) => {
-                plan.run(indexer_url).await.map(RescanCommitKind::Ledger9)
-            }
+            RescanPlanKind::Ledger8(plan) => plan.run(indexer).await.map(RescanCommitKind::Ledger8),
+            RescanPlanKind::Ledger9(plan) => plan.run(indexer).await.map(RescanCommitKind::Ledger9),
         };
         let kind = match result {
             Err(WalletError::LedgerMismatch { expected, found }) if found < expected => {
                 info!(%found, "the shielded stream starts in an earlier ledger; rescanning across the fork");
                 let start = ledger_8::ShieldedRescanPlan::new(&seed, &coins).initial_state;
-                let sub_client = SubscriptionClient::new(indexer_url);
+                let sub_client = SubscriptionClient::new(indexer);
                 let replayed = replay_zswap(
                     &sub_client,
                     &seed,
@@ -869,7 +865,7 @@ struct Resume {
 /// Who a sync is for, and where it keeps what it learns.
 #[derive(Clone)]
 pub(crate) struct ChainSync<'a> {
-    pub(crate) indexer_url: &'a str,
+    pub(crate) indexer: &'a IndexerEndpoint,
     pub(crate) seed: &'a Seed,
     pub(crate) address: &'a str,
     pub(crate) network: &'a Network,
@@ -890,7 +886,7 @@ async fn sync_once(
     sync: ChainSync<'_>,
     progress: Option<mpsc::Sender<SyncProgress>>,
 ) -> Result<State, WalletError> {
-    let block = latest_block(sync.indexer_url).await?;
+    let block = latest_block(sync.indexer).await?;
     let chain = ledger_of(&block)?;
     let wallet_id = wallet_storage_id(sync.address);
 
@@ -1025,7 +1021,7 @@ async fn sync_on_chain(
         }
     }
 
-    let sub_client = SubscriptionClient::new(sync.indexer_url);
+    let sub_client = SubscriptionClient::new(sync.indexer);
     info!(
         start_zswap_id,
         start_tx_id, start_dust_id, "starting subscriptions"

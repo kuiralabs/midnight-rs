@@ -11,7 +11,7 @@ use helpers::{
     LedgerState, MAX_SUPPLY, Recipient, SecretKeys, ShieldedWallet, Sp, Timestamp,
     UnshieldedWallet, Wallet as ContextWallet, WalletState as ZswapLocalState,
 };
-use midnight_indexer_client::SubscriptionClient;
+use midnight_indexer_client::{IndexerEndpoint, SubscriptionClient};
 use midnight_types::{SyncCursors, TrackedUtxo};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -89,14 +89,17 @@ pub struct Wallet {
     ///
     /// The cursors are event counts, so they mean nothing against a different
     /// server: a replay resumed elsewhere would apply another indexer's events
-    /// to this state. Holding the URL here keeps every later replay on the
+    /// to this state. Holding the endpoint here keeps every later replay on the
     /// wallet's own indexer rather than one a consumer supplies.
     ///
     /// It binds nothing across a restart. The snapshot records no indexer
     /// identity, so a sync from a source on another indexer, with
     /// `.with_storage(dir)`, resumes these cursors against that indexer and
     /// nothing notices.
-    indexer_url: String,
+    ///
+    /// The whole endpoint, credential included, so a later replay reaches an
+    /// indexer that requires one.
+    indexer: IndexerEndpoint,
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +315,7 @@ impl ResyncPlan {
     /// The replay phase of [`crate::wallet::ResyncPlan::run`] on this
     /// generation. It returns [`WalletError::LedgerMismatch`] when the chain
     /// moved to a later generation, for the caller to cross.
-    pub async fn run(self, indexer_url: &str) -> Result<ResyncCommit, WalletError> {
+    pub async fn run(self, indexer: &IndexerEndpoint) -> Result<ResyncCommit, WalletError> {
         let ResyncPlan {
             secret_keys,
             unshielded_address,
@@ -325,7 +328,7 @@ impl ResyncPlan {
             last_block_height,
         } = self;
 
-        let sub_client = SubscriptionClient::new(indexer_url);
+        let sub_client = SubscriptionClient::new(indexer);
 
         let start_tx_id = last_tx_id.map(|id| id + 1).unwrap_or(0);
 
@@ -360,7 +363,7 @@ impl ResyncPlan {
                 true,
                 None,
             ),
-            crate::replay::latest_block(indexer_url),
+            crate::replay::latest_block(indexer),
         );
 
         // Await every result before returning. If any task failed, no commit
@@ -455,8 +458,8 @@ impl ShieldedRescanPlan {
     /// The replay of [`crate::wallet::ShieldedRescanPlan::run`] on this
     /// generation. It returns [`WalletError::LedgerMismatch`] when the stream
     /// holds another generation's events.
-    pub async fn run(self, indexer_url: &str) -> Result<ShieldedRescanCommit, WalletError> {
-        let sub_client = SubscriptionClient::new(indexer_url);
+    pub async fn run(self, indexer: &IndexerEndpoint) -> Result<ShieldedRescanCommit, WalletError> {
+        let sub_client = SubscriptionClient::new(indexer);
         let replay = replay_zswap_events(
             &sub_client,
             &self.secret_keys,
@@ -532,8 +535,8 @@ impl Wallet {
 
     /// The indexer this wallet synced from, and the only one its cursors
     /// mean anything against.
-    pub fn indexer_url(&self) -> &str {
-        &self.indexer_url
+    pub fn indexer(&self) -> &IndexerEndpoint {
+        &self.indexer
     }
 
     /// See [`crate::Wallet::set_chain_pin`].
@@ -555,7 +558,7 @@ impl Wallet {
         progress: Option<mpsc::Sender<SyncProgress>>,
     ) -> Result<Self, WalletError> {
         let ChainSync {
-            indexer_url,
+            indexer,
             seed,
             address,
             network,
@@ -587,7 +590,7 @@ impl Wallet {
             ),
         };
 
-        let sub_client = SubscriptionClient::new(indexer_url);
+        let sub_client = SubscriptionClient::new(indexer);
         let dust_checkpoint = make_dust_checkpoint(
             save_dir,
             network.as_str(),
@@ -666,7 +669,7 @@ impl Wallet {
             pending,
             storage_dir: storage_dir.map(Path::to_path_buf),
             save_failed: false,
-            indexer_url: indexer_url.to_string(),
+            indexer: indexer.clone(),
         };
 
         // Reservations made before a restart whose spends this replay just
@@ -1630,7 +1633,7 @@ mod tests {
             pending: PendingReservations::default(),
             storage_dir,
             save_failed: false,
-            indexer_url: "http://indexer.invalid".into(),
+            indexer: "http://indexer.invalid".into(),
         }
     }
 
@@ -2473,7 +2476,11 @@ mod tests {
         use super::*;
 
         async fn rescan(wallet: &mut Wallet, url: &str) {
-            let commit = wallet.shielded_rescan_plan().run(url).await.unwrap();
+            let commit = wallet
+                .shielded_rescan_plan()
+                .run(&url.into())
+                .await
+                .unwrap();
             wallet.commit_shielded_rescan(commit).unwrap();
         }
 

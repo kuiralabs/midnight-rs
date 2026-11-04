@@ -94,6 +94,10 @@ pub use midnight_types::{
 // midnight-wallet-facade either.
 pub use midnight_wallet_facade::WalletFacade;
 
+// What a sync takes for its indexer: a URL, or an endpoint with its own
+// layout and credential.
+pub use midnight_indexer_client::{IndexerCredential, IndexerEndpoint};
+
 pub use background::BackgroundSync;
 pub use local::LocalWallet;
 pub use midnight_types::hd::{self, AccountKey, Role, RoleKey, Seed, SeedError, mnemonic};
