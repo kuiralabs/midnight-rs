@@ -310,8 +310,40 @@ impl LedgerStream {
     }
 }
 
-/// Events between two progress reports of a ledger-event replay.
-const PROGRESS_INTERVAL: u64 = 10_000;
+/// Events between two "replay progress" log lines of a ledger-event replay.
+const LOG_INTERVAL: u64 = 10_000;
+
+/// Longest a ledger-event replay goes without reporting progress while it
+/// applies events.
+///
+/// A consumer may keep the sync alive on progress: iOS expires a
+/// continued-processing task that stops reporting for about 30 seconds, and
+/// on a phone in the background 10,000 Dust events take longer than that.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Says when a replay reports: on its first applied event, then on the first
+/// one after each interval.
+struct ProgressPacer {
+    interval: std::time::Duration,
+    last: Option<std::time::Instant>,
+}
+
+impl ProgressPacer {
+    fn new(interval: std::time::Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+        }
+    }
+
+    fn due(&mut self, now: std::time::Instant) -> bool {
+        if matches!(self.last, Some(last) if now.duration_since(last) < self.interval) {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
 
 /// Where a ledger-event replay stopped.
 pub(crate) struct LedgerReplay {
@@ -346,6 +378,7 @@ pub(crate) async fn replay_ledger_events(
     let kind = stream.kind();
     let mut last_id: i64 = last_applied_before(start_id);
     let mut count: u64 = 0;
+    let mut pacer = ProgressPacer::new(PROGRESS_INTERVAL);
     let mut retries: u32 = 0;
     let mut later_ledger = None;
 
@@ -414,13 +447,15 @@ pub(crate) async fn replay_ledger_events(
                     last_id = msg.id;
                     count += 1;
 
-                    if count.is_multiple_of(PROGRESS_INTERVAL) {
+                    if count.is_multiple_of(LOG_INTERVAL) {
                         info!(
                             count,
                             id = msg.id,
                             max_id = msg.max_id,
                             "{kind} replay progress"
                         );
+                    }
+                    if pacer.due(std::time::Instant::now()) {
                         let alive = send_progress(&progress, stream.events(msg.id, msg.max_id));
                         if !alive {
                             return Err(progress_cancelled(kind));
@@ -910,6 +945,87 @@ mod tests {
                 intent_hash: HashOutput([0xab; 32]),
                 output_index: 2,
             }]
+        );
+    }
+
+    /// A consumer that keeps the sync alive on progress must hear from a
+    /// replay before it completes, however few events the chain has.
+    #[tokio::test]
+    async fn a_replay_of_a_few_events_reports_progress_before_it_completes() {
+        use midnight_indexer_client::testutil::{
+            accept_subscriber, ledger_event, next_json, send_next,
+        };
+
+        use crate::wallet::test_support::{test_seed, unreachable_coin};
+
+        let (listener, url) = bind().await;
+        tokio::spawn(async move {
+            let (mut ws, sub) = accept_subscriber(&listener).await;
+            for id in 1..=3 {
+                let raw = crate::ledger_9::state::test_support::ciphertextless_output(
+                    &test_seed(),
+                    &unreachable_coin(id as u8, 1),
+                    id as u64 - 1,
+                );
+                send_next(
+                    &mut ws,
+                    &sub,
+                    ledger_event("zswapLedgerEvents", id, &raw, 3),
+                )
+                .await;
+            }
+            while next_json(&mut ws).await.is_some() {}
+        });
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let replay = replay_ledger_events(
+            &SubscriptionClient::new(&url),
+            LedgerStream::Zswap,
+            LedgerVersion::V9,
+            0,
+            false,
+            Some(tx),
+            |_, _, _| Ok(()),
+        )
+        .await
+        .expect("the replay completes");
+
+        assert_eq!(replay.last_id, 3);
+        let mut reported = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            reported.push(format!("{update:?}"));
+        }
+        assert_eq!(
+            reported.first().map(String::as_str),
+            Some("ZswapEvents { current: 1, max: 3 }"),
+            "the first applied event must report: {reported:?}"
+        );
+        assert_eq!(
+            reported.last().map(String::as_str),
+            Some("ZswapComplete { events: 3 }"),
+            "{reported:?}"
+        );
+    }
+
+    #[test]
+    fn progress_is_reported_on_the_first_event_then_once_per_interval() {
+        let interval = std::time::Duration::from_secs(1);
+        let start = std::time::Instant::now();
+        let mut pacer = ProgressPacer::new(interval);
+
+        assert!(pacer.due(start), "the first event must report at once");
+        assert!(
+            !pacer.due(start + interval / 2),
+            "reported again inside the interval"
+        );
+        assert!(
+            pacer.due(start + interval),
+            "a full interval passed without a report"
+        );
+        assert!(!pacer.due(start + interval + interval / 2));
+        assert!(
+            pacer.due(start + interval * 30),
+            "a slow event must still report once it lands"
         );
     }
 

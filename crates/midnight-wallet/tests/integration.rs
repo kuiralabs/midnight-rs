@@ -110,6 +110,50 @@ async fn sync_replays_events() {
     }
 }
 
+/// A consumer that keeps the sync alive on progress, as an iOS background
+/// task does, must hear from each replay before it finishes, however few
+/// events the chain has.
+#[tokio::test]
+async fn each_replay_reports_progress_before_it_completes() {
+    use midnight_wallet::SyncProgress;
+
+    let Some((node, indexer)) = devnet_urls() else {
+        return;
+    };
+    let provider = MidnightProvider::new(&node);
+    let (mut rx, handle) = Wallet::from_seed(DEV_SEED)
+        .expect("hex seed")
+        .with_network(midnight_wallet::Network::Undeployed)
+        .sync_with_progress(&provider, &indexer)
+        .await
+        .expect("sync starts");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    handle.await.expect("indexer sync should succeed");
+
+    let position = |pred: &dyn Fn(&SyncProgress) -> bool| events.iter().position(pred);
+    let zswap_complete =
+        position(&|e| matches!(e, SyncProgress::ZswapComplete { events } if *events > 0))
+            .expect("the zswap replay completes having applied events");
+    let dust_complete =
+        position(&|e| matches!(e, SyncProgress::DustComplete { events } if *events > 0))
+            .expect("the dust replay completes having applied events");
+    let zswap_progress = position(&|e| matches!(e, SyncProgress::ZswapEvents { .. }));
+    let dust_progress = position(&|e| matches!(e, SyncProgress::DustEvents { .. }));
+
+    assert!(
+        zswap_progress.is_some_and(|i| i < zswap_complete),
+        "the zswap replay finished without reporting progress: {events:?}"
+    );
+    assert!(
+        dust_progress.is_some_and(|i| i < dust_complete),
+        "the dust replay finished without reporting progress: {events:?}"
+    );
+}
+
 /// The rebuild a person reaches for when a balance looks wrong. Through the
 /// provider, as an app calls it, it must replay the chain from its first
 /// event rather than resume from the cursors it was asked to discard, and it

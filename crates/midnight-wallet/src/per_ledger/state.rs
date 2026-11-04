@@ -107,7 +107,81 @@ pub struct Wallet {
 // ---------------------------------------------------------------------------
 
 /// Number of dust events between checkpoint saves during initial sync.
-const DUST_CHECKPOINT_INTERVAL: u64 = 50_000;
+pub(crate) const DUST_CHECKPOINT_INTERVAL: u64 = 50_000;
+
+/// Events handed to the ledger per `replay_events` call.
+///
+/// The ledger rehashes its Merkle trees once per call, along every path the
+/// call's events touched. One event per call paid a full root-to-leaf rehash
+/// for each, about 30 Poseidon hashes per tree, and that hashing was most of
+/// a PreProd sync. A batch shares the upper levels of those paths.
+const REPLAY_BATCH: usize = 1_000;
+
+/// Decoded events waiting for one `replay_events` call, with the indexer ids
+/// they span.
+struct ReplayBatch {
+    events: Vec<Event<DefaultDB>>,
+    first_id: i64,
+    last_id: i64,
+}
+
+impl ReplayBatch {
+    fn new() -> Self {
+        Self {
+            events: Vec::with_capacity(REPLAY_BATCH),
+            first_id: 0,
+            last_id: 0,
+        }
+    }
+
+    fn push(&mut self, id: i64, event: Event<DefaultDB>) {
+        if self.events.is_empty() {
+            self.first_id = id;
+        }
+        self.last_id = id;
+        self.events.push(event);
+    }
+
+    fn is_full(&self) -> bool {
+        self.events.len() >= REPLAY_BATCH
+    }
+
+    /// Apply the waiting events to `wallet`, and empty the batch.
+    fn apply_dust(&mut self, wallet: &mut DustWallet<DefaultDB>) -> Result<(), WalletError> {
+        if self.events.is_empty() {
+            return Ok(());
+        }
+        wallet.replay_events(self.events.iter()).map_err(|e| {
+            WalletError::Sync(format!(
+                "apply dust events id={}..={}: {e}",
+                self.first_id, self.last_id
+            ))
+        })?;
+        self.events.clear();
+        Ok(())
+    }
+
+    /// `state` with the waiting events applied, and the batch emptied.
+    fn apply_zswap(
+        &mut self,
+        state: &ZswapLocalState<DefaultDB>,
+        secret_keys: &SecretKeys,
+    ) -> Result<Option<ZswapLocalState<DefaultDB>>, WalletError> {
+        if self.events.is_empty() {
+            return Ok(None);
+        }
+        let state = state
+            .replay_events(secret_keys, self.events.iter())
+            .map_err(|e| {
+                WalletError::Sync(format!(
+                    "replay zswap events id={}..={}: {e}",
+                    self.first_id, self.last_id
+                ))
+            })?;
+        self.events.clear();
+        Ok(Some(state))
+    }
+}
 
 type DustCheckpointFn = dyn Fn(&DustWallet<DefaultDB>, i64) + Send;
 
@@ -339,6 +413,7 @@ impl ResyncPlan {
                 dust_event_id + 1,
                 true,
                 None::<fn(&DustWallet<DefaultDB>, i64)>,
+                DUST_CHECKPOINT_INTERVAL,
                 None,
             ),
             replay_zswap_events(
@@ -611,6 +686,7 @@ impl Wallet {
             start_dust_id,
             dust_resuming,
             dust_checkpoint,
+            DUST_CHECKPOINT_INTERVAL,
             progress.clone(),
         )
         .await?;
@@ -1370,6 +1446,7 @@ pub(crate) async fn replay_zswap_events(
     progress: Option<mpsc::Sender<SyncProgress>>,
 ) -> Result<ZswapReplay, WalletError> {
     let mut state = initial_state;
+    let mut batch = ReplayBatch::new();
     let replay = replay_ledger_events(
         sub_client,
         LedgerStream::Zswap,
@@ -1379,14 +1456,21 @@ pub(crate) async fn replay_zswap_events(
         progress,
         |id, raw, ledger| {
             expect_ledger(ledger)?;
-            let ev = decode_event(raw, "zswap")?;
-            state = state
-                .replay_events(secret_keys, [&ev])
-                .map_err(|e| WalletError::Sync(format!("replay zswap event id={id}: {e}")))?;
+            batch.push(id, decode_event(raw, "zswap")?);
+            if batch.is_full()
+                && let Some(applied) = batch.apply_zswap(&state, secret_keys)?
+            {
+                state = applied;
+            }
             Ok(())
         },
     )
     .await?;
+    // The replay consumed every event in the batch, so the state must hold
+    // them before it is returned.
+    if let Some(applied) = batch.apply_zswap(&state, secret_keys)? {
+        state = applied;
+    }
 
     Ok(ZswapReplay {
         state,
@@ -1414,12 +1498,17 @@ pub(crate) struct DustReplay {
 /// The replay consumes the events of an earlier generation without applying
 /// them. The hard fork to this generation replaced the chain's Dust state
 /// with an empty one, so these events describe Dust that no longer exists.
+///
+/// After every `checkpoint_every` consumed events, the replay hands the
+/// wallet and the id of the last event to `checkpoint`. Production passes
+/// [`DUST_CHECKPOINT_INTERVAL`].
 pub(crate) async fn replay_dust_events(
     sub_client: &SubscriptionClient,
     mut dust_wallet: DustWallet<DefaultDB>,
     start_id: i64,
     resuming: bool,
     checkpoint: Option<impl Fn(&DustWallet<DefaultDB>, i64)>,
+    checkpoint_every: u64,
     progress: Option<mpsc::Sender<SyncProgress>>,
 ) -> Result<DustReplay, WalletError> {
     let mut last_block_time: Option<Timestamp> = None;
@@ -1427,13 +1516,15 @@ pub(crate) async fn replay_dust_events(
     // surfaced to the caller so it can clear confirmed pending reservations.
     let mut spend_nullifiers: Vec<DustNullifier> = Vec::new();
     let mut consumed: u64 = 0;
+    let mut batch = ReplayBatch::new();
     // The closure owns `checkpoint` and borrows the rest through these
     // bindings. The sync's checkpoint is `Send` but not `Sync`, so a borrow of
     // it would make the replay future lose `Send`.
-    let (wallet, last_time, nullifiers) = (
+    let (wallet, last_time, nullifiers, waiting) = (
         &mut dust_wallet,
         &mut last_block_time,
         &mut spend_nullifiers,
+        &mut batch,
     );
     let replay = replay_ledger_events(
         sub_client,
@@ -1445,26 +1536,33 @@ pub(crate) async fn replay_dust_events(
         move |id, raw, ledger| {
             if ledger == super::LEDGER {
                 let ev = decode_event(raw, "dust")?;
-                wallet
-                    .replay_events([&ev])
-                    .map_err(|e| WalletError::Sync(format!("apply dust event id={id}: {e}")))?;
                 if let Some(t) = event_block_time(&ev) {
                     *last_time = Some(t);
                 }
                 if let Some(n) = event_spend_nullifier(&ev) {
                     nullifiers.push(n);
                 }
+                waiting.push(id, ev);
+                if waiting.is_full() {
+                    waiting.apply_dust(wallet)?;
+                }
             }
             consumed += 1;
-            if consumed.is_multiple_of(DUST_CHECKPOINT_INTERVAL)
+            if consumed.is_multiple_of(checkpoint_every)
                 && let Some(save) = &checkpoint
             {
+                // The checkpoint's cursor says every event up to it is in
+                // the wallet it saves.
+                waiting.apply_dust(wallet)?;
                 save(wallet, id);
             }
             Ok(())
         },
     )
     .await?;
+    // The replay consumed every event in the batch, so the wallet must hold
+    // them before it is returned.
+    batch.apply_dust(&mut dust_wallet)?;
 
     Ok(DustReplay {
         wallet: dust_wallet,
@@ -2678,6 +2776,200 @@ mod tests {
         wallet.commit_resync(commit).unwrap();
 
         assert!(wallet.registered_coins().is_empty());
+    }
+
+    /// The replay loops hand the ledger a batch of events per call. Batching
+    /// must change how fast the trees are rehashed and nothing else: these
+    /// drive the real loops over a mock indexer and compare the result, byte
+    /// for byte, with the same events applied one call at a time.
+    mod batched_replay_ws {
+        use std::sync::Mutex;
+
+        use helpers::mn_ledger::dust::{
+            DustGenerationInfo, DustPublicKey, InitialNonce, QualifiedDustOutput,
+        };
+        use helpers::mn_ledger::events::ZswapPreimageEvidence;
+        use midnight_indexer_client::testutil::{
+            accept_subscriber, bind, ledger_event, next_json, send_next,
+        };
+
+        use super::*;
+
+        fn empty_dust_wallet() -> DustWallet<DefaultDB> {
+            DustWallet::default((&test_seed()).into_ledger(), Some(&INITIAL_PARAMETERS))
+        }
+
+        /// A foreign Night-backed Dust output. It does not belong to the
+        /// wallet, but every such event still lands in both of its trees,
+        /// which is all the rehash depends on.
+        fn initial_dust_utxo(index: u64) -> Event<DefaultDB> {
+            let owner = DustPublicKey(Fr::from(index + 1));
+            let night = InitialNonce(HashOutput([(index % 251) as u8; 32]));
+            zero_source_event(EventDetails::DustInitialUtxo {
+                output: QualifiedDustOutput {
+                    initial_value: 1_000 + u128::from(index),
+                    owner,
+                    nonce: Fr::from(index + 7),
+                    seq: 0,
+                    ctime: Timestamp::from_secs(100),
+                    backing_night: night,
+                    mt_index: index,
+                },
+                generation: DustGenerationInfo {
+                    value: 5_000,
+                    owner,
+                    nonce: night,
+                    dtime: Timestamp::MAX,
+                },
+                generation_index: index,
+                block_time: Timestamp::from_secs(100 + index),
+            })
+        }
+
+        fn zswap_output(index: u64) -> Event<DefaultDB> {
+            zero_source_event(EventDetails::ZswapOutput {
+                commitment: Commitment(HashOutput([(index % 251) as u8 + 1; 32])),
+                preimage_evidence: ZswapPreimageEvidence::None,
+                contract: None,
+                mt_index: index,
+            })
+        }
+
+        fn bytes<T>(value: &T) -> Vec<u8>
+        where
+            T: helpers::midnight_serialize::Serializable + helpers::midnight_serialize::Tagged,
+        {
+            let mut out = Vec::new();
+            tagged_serialize(value, &mut out).unwrap();
+            out
+        }
+
+        /// Serve `events` as indexer ids 1..=n on one subscription of
+        /// `field`, then wait for the client to go.
+        async fn serve(field: &'static str, events: Vec<Event<DefaultDB>>) -> String {
+            let (listener, url) = bind().await;
+            tokio::spawn(async move {
+                let (mut ws, sub) = accept_subscriber(&listener).await;
+                let max_id = events.len() as i64;
+                for (i, event) in events.iter().enumerate() {
+                    let raw = hex::encode(bytes(event));
+                    send_next(
+                        &mut ws,
+                        &sub,
+                        ledger_event(field, i as i64 + 1, &raw, max_id),
+                    )
+                    .await;
+                }
+                while next_json(&mut ws).await.is_some() {}
+            });
+            url
+        }
+
+        #[tokio::test]
+        async fn a_batched_dust_replay_matches_one_event_at_a_time() {
+            // Not a multiple of the batch: the last, partial batch must be
+            // applied too.
+            let events: Vec<_> = (0..1_200).map(initial_dust_utxo).collect();
+            let url = serve("dustLedgerEvents", events.clone()).await;
+
+            let replay = replay_dust_events(
+                &SubscriptionClient::new(&url),
+                empty_dust_wallet(),
+                0,
+                false,
+                None::<fn(&DustWallet<DefaultDB>, i64)>,
+                DUST_CHECKPOINT_INTERVAL,
+                None,
+            )
+            .await
+            .expect("replay");
+
+            let mut one_at_a_time = empty_dust_wallet();
+            for event in &events {
+                one_at_a_time.replay_events([event]).unwrap();
+            }
+            assert_eq!(replay.last_id, 1_200);
+            assert!(
+                bytes(&replay.wallet) == bytes(&one_at_a_time),
+                "the batched replay left a different Dust wallet"
+            );
+        }
+
+        /// A checkpoint's cursor says every event up to it is in the wallet
+        /// it saves. With events waiting in a batch, saving before applying
+        /// them would lose them for good, because a resume starts after the
+        /// cursor.
+        #[tokio::test]
+        async fn a_dust_checkpoint_saves_every_event_up_to_its_cursor() {
+            // Not a multiple of the batch, so the checkpoint falls with events
+            // still waiting.
+            let every: u64 = 1_100;
+            let total = every + 200;
+            let events: Vec<_> = (0..total).map(initial_dust_utxo).collect();
+            let url = serve("dustLedgerEvents", events.clone()).await;
+            let saved: Mutex<Vec<(i64, Vec<u8>)>> = Mutex::new(Vec::new());
+
+            replay_dust_events(
+                &SubscriptionClient::new(&url),
+                empty_dust_wallet(),
+                0,
+                false,
+                Some(|wallet: &DustWallet<DefaultDB>, cursor: i64| {
+                    saved.lock().unwrap().push((cursor, bytes(wallet)));
+                }),
+                every,
+                None,
+            )
+            .await
+            .expect("replay");
+
+            let saved = saved.into_inner().unwrap();
+            assert_eq!(
+                saved.len(),
+                1,
+                "one checkpoint expected, got cursors {:?}",
+                saved.iter().map(|s| s.0).collect::<Vec<_>>()
+            );
+            let (cursor, wallet) = &saved[0];
+            assert_eq!(*cursor, every as i64);
+            let mut expected = empty_dust_wallet();
+            expected
+                .replay_events(events[..every as usize].iter())
+                .unwrap();
+            assert!(
+                *wallet == bytes(&expected),
+                "the checkpoint at {cursor} is missing events it claims to hold"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_batched_zswap_replay_matches_one_event_at_a_time() {
+            let events: Vec<_> = (0..1_200).map(zswap_output).collect();
+            let url = serve("zswapLedgerEvents", events.clone()).await;
+            let shielded = ShieldedWallet::<DefaultDB>::default((&test_seed()).into_ledger());
+            let keys = shielded.secret_keys().clone();
+
+            let replay = replay_zswap_events(
+                &SubscriptionClient::new(&url),
+                &keys,
+                shielded.state.clone(),
+                0,
+                false,
+                None,
+            )
+            .await
+            .expect("replay");
+
+            let mut one_at_a_time = shielded.state.clone();
+            for event in &events {
+                one_at_a_time = one_at_a_time.replay_events(&keys, [event]).unwrap();
+            }
+            assert_eq!(replay.last_id, 1_200);
+            assert!(
+                bytes(&replay.state) == bytes(&one_at_a_time),
+                "the batched replay left a different shielded state"
+            );
+        }
     }
 
     /// Mock-WebSocket-server test for a replay's resume, driven through the

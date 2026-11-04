@@ -1402,6 +1402,7 @@ mod tests {
             0,
             false,
             None::<fn(&ledger_9::DustWallet<DefaultDB>, i64)>,
+            crate::ledger_9::state::DUST_CHECKPOINT_INTERVAL,
             None,
         )
         .await
