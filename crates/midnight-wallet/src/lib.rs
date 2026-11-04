@@ -85,10 +85,10 @@ pub use midnight_types::address::{parse_dust_address, parse_shielded_recipient};
 pub use midnight_types::{
     ChainParameters, CoinInfo, CoinPublicKey, CoinSelectionStrategy, DustBalance, DustParameters,
     DustPublicKey, EncryptionPublicKey, HashOutput, InvalidNetworkName, LedgerVersion, NIGHT,
-    Network, NetworkName, Nonce, Nullifier, ReservedInput, ShieldedBalance, ShieldedCoinBalance,
-    ShieldedRecipient, ShieldedTokenType, SpendableShieldedCoin, SpentInputs, SpentUtxoKey,
-    SyncCursors, TrackedUtxo, TransferKind, TransferRequest, TransferResult, UnshieldedTokenType,
-    UnshieldedUtxoInfo, WalletBalance, WalletError, chain_pin,
+    Network, NetworkName, Nonce, Nullifier, ProgressSink, ReservedInput, ShieldedBalance,
+    ShieldedCoinBalance, ShieldedRecipient, ShieldedTokenType, SpendableShieldedCoin, SpentInputs,
+    SpentUtxoKey, SyncCursors, SyncProgress, TrackedUtxo, TransferKind, TransferRequest,
+    TransferResult, UnshieldedTokenType, UnshieldedUtxoInfo, WalletBalance, WalletError, chain_pin,
 };
 // The API this crate implements, so attaching a wallet needs no dependency on
 // midnight-wallet-facade either.
@@ -101,5 +101,5 @@ pub use midnight_indexer_client::{IndexerCredential, IndexerEndpoint};
 pub use background::BackgroundSync;
 pub use local::LocalWallet;
 pub use midnight_types::hd::{self, AccountKey, Role, RoleKey, Seed, SeedError, mnemonic};
-pub use sync::{SyncHandle, SyncProgress, WalletBuilder};
+pub use sync::{SyncHandle, WalletBuilder};
 pub use wallet::Wallet;

@@ -56,7 +56,7 @@ pub use parameters::{ChainParameters, DustParameters};
 /// `Display` abbreviates it to `0x1234…cdef`. Format it with `{:x}`, or with
 /// `{:#x}` for a `0x` prefix, to get the whole digest.
 pub use primitive_types::H256;
-pub use sync::{SyncCursors, TrackedUtxo};
+pub use sync::{ProgressSink, SyncCursors, SyncProgress, TrackedUtxo};
 pub use transfer::{
     ReservedInput, SpentInputs, SpentUtxoKey, TransferKind, TransferRequest, TransferResult,
 };

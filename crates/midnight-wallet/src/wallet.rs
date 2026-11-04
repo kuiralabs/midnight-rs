@@ -360,6 +360,35 @@ impl Wallet {
         }
     }
 
+    /// Snapshot the inputs of a rebuild from the chain's first event. See
+    /// [`ResyncPlan`].
+    ///
+    /// The plan carries none of the replayed state, only who the wallet is
+    /// and the coins a state rebuilt from scratch must be told about (see
+    /// [`Self::shielded_rescan_plan`]). The rebuild then runs the sync a
+    /// first sync runs, from the earliest generation this build links, and
+    /// crosses each hard fork the chain's history holds.
+    pub(crate) fn resync_plan_from_genesis(&self) -> ResyncPlan {
+        let (identity, address, coins) = each!(&self.state, w => (
+            WalletIdentity {
+                seed: self.seed.clone(),
+                network: w.network().clone(),
+                storage_dir: w.storage_dir().map(Path::to_path_buf),
+                chain_pin: w.chain_pin().cloned(),
+            },
+            w.unshielded_address(),
+            w.rescan_coins(),
+        ));
+        ResyncPlan {
+            indexer: each!(&self.state, w => w.indexer()).clone(),
+            kind: ResyncPlanKind::Genesis {
+                identity,
+                address,
+                coins,
+            },
+        }
+    }
+
     /// Apply validated resync results to `self`, and persist when they change
     /// durable state. A commit also persists when the last save failed.
     /// Separate from [`ResyncPlan::run`], which performs the I/O and
@@ -397,6 +426,11 @@ impl Wallet {
     /// registrations, and the chain pin stays as the commit finds it. The
     /// reservations do not carry over: a transaction built for the earlier
     /// generation cannot land on the chain that left it.
+    ///
+    /// A rebuild from genesis replaces the state with the one its replay
+    /// built, in whichever generation the chain now runs, and saves it. A
+    /// rebuild in the wallet's own generation keeps the reservations, whose
+    /// transactions may still land.
     pub(crate) fn commit_resync(&mut self, commit: ResyncCommit) -> Result<(), WalletError> {
         match (&mut self.state, commit.0) {
             (State::Ledger8(w), ResyncCommitKind::Ledger8(c)) => w.commit_resync(c),
@@ -410,15 +444,27 @@ impl Wallet {
                 info!("the wallet crossed to ledger 9");
                 saved
             }
-            (_, commit) => Err(WalletError::LedgerMismatch {
+            (_, ResyncCommitKind::Rebuilt(mut state)) => {
+                match (&mut self.state, &mut *state) {
+                    (State::Ledger8(old), State::Ledger8(new)) => new.adopt_pending(old),
+                    (State::Ledger9(old), State::Ledger9(new)) => new.adopt_pending(old),
+                    _ => {}
+                }
+                let saved = each!(&mut *state, w => w.persist(true));
+                self.state = *state;
+                info!(ledger = %self.ledger_version(), "the wallet was rebuilt from genesis");
+                saved
+            }
+            (_, ResyncCommitKind::Ledger9(_)) => Err(WalletError::LedgerMismatch {
                 expected: self.ledger_version(),
-                found: match commit {
-                    ResyncCommitKind::Ledger9(_) => LedgerVersion::V9,
-                    ResyncCommitKind::Ledger8(_) | ResyncCommitKind::Crossed(_) => {
-                        LedgerVersion::V8
-                    }
-                },
+                found: LedgerVersion::V9,
             }),
+            (_, ResyncCommitKind::Ledger8(_) | ResyncCommitKind::Crossed(_)) => {
+                Err(WalletError::LedgerMismatch {
+                    expected: self.ledger_version(),
+                    found: LedgerVersion::V8,
+                })
+            }
         }
     }
 
@@ -498,6 +544,14 @@ enum ResyncPlanKind {
         identity: WalletIdentity,
     },
     Ledger9(ledger_9::ResyncPlan),
+    /// A rebuild from the chain's first event.
+    Genesis {
+        identity: WalletIdentity,
+        /// The wallet's unshielded address.
+        address: String,
+        /// The coins the rebuilt shielded state registers before its replay.
+        coins: Vec<CoinInfo>,
+    },
 }
 
 /// What a resync that crosses a hard fork needs beyond its plan, to build
@@ -530,10 +584,22 @@ impl ResyncPlan {
     /// to the fork and carries the shielded state across. Then it replays the
     /// Dust stream into an empty state of the later generation. It writes
     /// nothing, and the commit saves the crossed state.
-    pub(crate) async fn run(self) -> Result<ResyncCommit, WalletError> {
+    ///
+    /// A rebuild from genesis reports to `progress` what a first sync
+    /// reports, and like a first sync, it reads an indexer that sends nothing
+    /// as a stall, not as the tip. A resync from cursors reports nothing.
+    pub(crate) async fn run(
+        self,
+        progress: Option<mpsc::Sender<SyncProgress>>,
+    ) -> Result<ResyncCommit, WalletError> {
         let ResyncPlan { indexer, kind } = self;
         let indexer = &indexer;
         match kind {
+            ResyncPlanKind::Genesis {
+                identity,
+                address,
+                coins,
+            } => rebuild(&identity, &address, &coins, indexer, progress).await,
             ResyncPlanKind::Ledger9(plan) => Ok(ResyncCommit(ResyncCommitKind::Ledger9(
                 plan.run(indexer).await?,
             ))),
@@ -558,6 +624,45 @@ impl ResyncPlan {
             }
         }
     }
+}
+
+/// Rebuild a wallet from the chain's first event, as a first sync builds it.
+///
+/// The shielded state starts empty in the earliest generation this build
+/// links, with `coins` registered, and the sync crosses each hard fork the
+/// chain's history holds. Nothing is written: the commit saves the state.
+async fn rebuild(
+    identity: &WalletIdentity,
+    address: &str,
+    coins: &[CoinInfo],
+    indexer: &IndexerEndpoint,
+    progress: Option<mpsc::Sender<SyncProgress>>,
+) -> Result<ResyncCommit, WalletError> {
+    let sync = ChainSync {
+        indexer,
+        seed: &identity.seed,
+        address,
+        network: &identity.network,
+        storage_dir: identity.storage_dir.as_deref(),
+        save: false,
+        chain_pin: identity.chain_pin.clone(),
+    };
+    let start = || {
+        let registered = ledger_8::ShieldedRescanPlan::new(&identity.seed, coins).initial_state;
+        Start::Genesis(Box::new(ZswapState::Ledger8(registered)))
+    };
+    let block = latest_block(indexer).await?;
+    // A chain can fork between the read of its latest block and the replay,
+    // as for a first sync.
+    let state = match sync_on_chain(sync.clone(), &block, start(), progress.clone()).await {
+        Err(WalletError::LedgerMismatch { expected, found }) if found > expected => {
+            info!(%found, "the chain moved to a later ledger during the rebuild; rebuilding again");
+            let block = latest_block(indexer).await?;
+            sync_on_chain(sync, &block, start(), progress).await?
+        }
+        result => result?,
+    };
+    Ok(ResyncCommit(ResyncCommitKind::Rebuilt(Box::new(state))))
 }
 
 /// Replay a ledger 8 wallet's plan onto a chain that crossed to ledger 9,
@@ -599,7 +704,7 @@ async fn cross(
             chain_pin: identity.chain_pin,
         },
         block,
-        Some(from),
+        Start::Resume(Box::new(from)),
         None,
     )
     .await?;
@@ -628,6 +733,9 @@ enum ResyncCommitKind {
     /// A ledger 8 wallet's resync that crossed the fork to ledger 9: the
     /// wallet again, in ledger 9.
     Crossed(Box<ledger_9::Wallet>),
+    /// A rebuild from genesis: the wallet again, in the generation the chain
+    /// runs.
+    Rebuilt(Box<State>),
 }
 
 /// Snapshot of what a shielded rescan's replay consumes, taken from a
@@ -862,6 +970,15 @@ struct Resume {
     last_block_height: i64,
 }
 
+/// Where a sync starts.
+enum Start {
+    /// From a snapshot, or a wallet in memory.
+    Resume(Box<Resume>),
+    /// From the chain's first event, with this shielded state, which is empty
+    /// but for the coins it registers.
+    Genesis(Box<ZswapState>),
+}
+
 /// Who a sync is for, and where it keeps what it learns.
 #[derive(Clone)]
 pub(crate) struct ChainSync<'a> {
@@ -895,7 +1012,7 @@ async fn sync_once(
         Some(dir) => load_snapshot(dir, sync.network.as_str(), &wallet_id, chain)?,
         None => None,
     };
-    let (resume, sync) = match snapshot {
+    let (start, sync) = match snapshot {
         Some((resume, stored_pin)) => {
             info!(
                 zswap_event_id = resume.zswap_event_id,
@@ -917,11 +1034,19 @@ async fn sync_once(
             // A node that could not answer must not cost the wallet the mark
             // that lets the next resume check itself.
             let chain_pin = sync.chain_pin.or(stored_pin);
-            (Some(resume), ChainSync { chain_pin, ..sync })
+            (
+                Start::Resume(Box::new(resume)),
+                ChainSync { chain_pin, ..sync },
+            )
         }
-        None => (None, sync),
+        None => (
+            Start::Genesis(Box::new(ZswapState::Ledger8(
+                midnight_helpers::ledger_8::WalletState::new(),
+            ))),
+            sync,
+        ),
     };
-    sync_on_chain(sync, &block, resume, progress).await
+    sync_on_chain(sync, &block, start, progress).await
 }
 
 /// A snapshot, in the generation that wrote it, and the chain pin it
@@ -973,25 +1098,29 @@ fn load_snapshot(
     })
 }
 
-/// Sync on a chain whose latest block is `block`, from `resume` or from
-/// genesis. Replay the shielded and unshielded streams, and cross each fork
-/// the shielded stream meets. Then finish in the chain's generation.
+/// Sync on a chain whose latest block is `block`, from `start`. Replay the
+/// shielded and unshielded streams, and cross each fork the shielded stream
+/// meets. Then finish in the chain's generation.
+///
+/// A sync from genesis reads an indexer that sends nothing as a stall and
+/// fails, since the state it would keep is the empty one it started from. A
+/// resume reads the same silence as the tip.
 async fn sync_on_chain(
     sync: ChainSync<'_>,
     block: &midnight_indexer_client::Block,
-    resume: Option<Resume>,
+    start: Start,
     progress: Option<mpsc::Sender<SyncProgress>>,
 ) -> Result<State, WalletError> {
     let chain = ledger_of(block)?;
-    let resuming = resume.is_some();
+    let resuming = matches!(start, Start::Resume(_));
     // Where each stream starts. When resuming, start from the next event
     // after the last one applied; the subscription is inclusive, so the
     // last one itself would be delivered again. A replay from genesis
     // starts in the earliest generation this build links, and crosses
     // forward to wherever the chain's history leads.
     let (zswap_start, start_zswap_id, dust_state, start_dust_id, utxos, start_tx_id, height) =
-        match resume {
-            Some(r) => (
+        match start {
+            Start::Resume(r) => (
                 r.zswap,
                 r.zswap_event_id + 1,
                 Some(r.dust),
@@ -1000,15 +1129,7 @@ async fn sync_on_chain(
                 r.last_tx_id.map(|id| id + 1).unwrap_or(0),
                 r.last_block_height,
             ),
-            None => (
-                ZswapState::Ledger8(midnight_helpers::ledger_8::WalletState::new()),
-                0,
-                None,
-                0,
-                Vec::new(),
-                0,
-                0,
-            ),
+            Start::Genesis(zswap) => (*zswap, 0, None, 0, Vec::new(), 0, 0),
         };
 
     // The fork from ledger 8 to ledger 9 emptied the chain's Dust state and
@@ -1026,7 +1147,9 @@ async fn sync_on_chain(
         start_zswap_id,
         start_tx_id, start_dust_id, "starting subscriptions"
     );
-    let (zswap, unshielded) = tokio::join!(
+    // The first replay to fail ends the other, whose result would be
+    // discarded anyway.
+    let (zswap, unshielded) = tokio::try_join!(
         replay_zswap(
             &sub_client,
             sync.seed,
@@ -1044,14 +1167,13 @@ async fn sync_on_chain(
             resuming,
             progress.clone(),
         ),
-    );
-    let zswap = zswap?;
+    )?;
     let UnshieldedReplay {
         utxos: unshielded_utxos,
         last_tx_id,
         last_block_height,
         spent: spent_unshielded,
-    } = unshielded?;
+    } = unshielded;
 
     match zswap.state.into_ledger(chain)? {
         ZswapState::Ledger8(zswap_state) => {
@@ -1259,6 +1381,247 @@ mod tests {
         );
         assert!(replay.later_ledger.is_none());
         assert!(replay.spend_nullifiers.is_empty());
+    }
+
+    /// Mock-indexer tests of a rebuild from genesis. The mock serves the
+    /// latest block over HTTP and the subscriptions over WebSocket, on one
+    /// port.
+    mod genesis_rebuild_ws {
+        use midnight_helpers::ledger_9::midnight_serialize::tagged_serialize;
+        use midnight_indexer_client::testutil::{
+            read_http_request, send_json, subscriber_handshake, unshielded_progress,
+            write_json_response,
+        };
+        use serde_json::json;
+        use tokio::net::TcpStream;
+
+        use super::*;
+
+        /// What the mock sends on a subscription: the parsed `subscribe`
+        /// message in, the `data` of each `next` message out.
+        type Stream = fn(&serde_json::Value) -> Vec<serde_json::Value>;
+
+        /// The latest block of a ledger 9 chain.
+        fn latest_block_body() -> String {
+            let mut parameters = Vec::new();
+            tagged_serialize(&ledger_9::INITIAL_PARAMETERS, &mut parameters).unwrap();
+            json!({"data": {"block": {
+                "hash": "00".repeat(32),
+                "height": 1,
+                "timestamp": 1_000_000,
+                "ledgerParameters": hex::encode(parameters),
+            }}})
+            .to_string()
+        }
+
+        /// An indexer that answers the latest-block query and every
+        /// subscription, sending on each what `stream` returns for it and
+        /// then nothing more. It answers the protocol's keepalive pings, so
+        /// it is alive however long it stays silent.
+        async fn indexer(stream: Stream) -> IndexerEndpoint {
+            let (listener, url) = midnight_indexer_client::testutil::bind().await;
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    tokio::spawn(serve(socket, stream));
+                }
+            });
+            IndexerEndpoint::from(url)
+        }
+
+        async fn serve(mut socket: TcpStream, stream: Stream) {
+            let mut head = [0u8; 2048];
+            let n = socket.peek(&mut head).await.unwrap();
+            let head = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
+            if !head.contains("upgrade: websocket") {
+                if read_http_request(&mut socket).await {
+                    write_json_response(&mut socket, "200 OK", &latest_block_body()).await;
+                }
+                return;
+            }
+            let (mut ws, sub) = subscriber_handshake(socket).await;
+            for data in stream(&sub) {
+                let id = sub["id"].as_str().unwrap();
+                let message = json!({"type": "next", "id": id, "payload": {"data": data}});
+                send_json(&mut ws, &message).await;
+            }
+            while let Some(message) = next_json(&mut ws).await {
+                if message["type"] == "ping" {
+                    send_json(&mut ws, &json!({"type": "pong"})).await;
+                }
+            }
+        }
+
+        fn silent(_: &serde_json::Value) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+
+        fn wallet(indexer: IndexerEndpoint) -> Wallet {
+            Wallet {
+                seed: test_seed(),
+                state: State::Ledger9(crate::ledger_9::state::test_support::offline_wallet(
+                    None, indexer,
+                )),
+            }
+        }
+
+        /// The state a rebuild starts from is empty, so an indexer with
+        /// nothing to say must fail it. Read as the tip, the silence commits
+        /// that empty state and wipes the wallet.
+        #[tokio::test]
+        async fn a_rebuild_reads_a_silent_indexer_as_a_stall_not_the_tip() {
+            let wallet = wallet(indexer(silent).await);
+
+            let result = wallet.resync_plan_from_genesis().run(None).await;
+
+            match result {
+                Err(err @ WalletError::Indexer { .. }) => assert!(
+                    err.to_string().contains("timeout waiting"),
+                    "expected the rebuild to give up on the silence, got: {err}"
+                ),
+                Err(other) => panic!("expected a stall, got: {other:?}"),
+                Ok(_) => panic!(
+                    "a rebuild that reads silence as the tip commits the empty state it started from"
+                ),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_resync_from_cursors_reads_a_silent_indexer_as_the_tip() {
+            let mut wallet = wallet(indexer(silent).await);
+            let before = wallet.sync_cursors();
+
+            let commit = wallet
+                .resync_plan()
+                .run(None)
+                .await
+                .expect("a resume with nothing new is at the tip");
+            wallet.commit_resync(commit).unwrap();
+
+            let after = wallet.sync_cursors();
+            assert_eq!(after.zswap_event_id, before.zswap_event_id);
+            assert_eq!(after.dust_event_id, before.dust_event_id);
+        }
+
+        /// A chain whose shielded history is one output to the wallet's
+        /// registered coin, and which has no Dust and no unshielded
+        /// transactions for it. The output is a ledger 9 event, so a replay
+        /// that starts in ledger 8 crosses on its first event.
+        fn one_registered_output(sub: &serde_json::Value) -> Vec<serde_json::Value> {
+            let query = sub["payload"]["query"].as_str().unwrap();
+            if query.contains("zswapLedgerEvents") {
+                let raw = crate::ledger_9::state::test_support::ciphertextless_output(
+                    &test_seed(),
+                    &unreachable_coin(5, 42),
+                    0,
+                );
+                vec![ledger_event("zswapLedgerEvents", 1, &raw, 1)]
+            } else if query.contains("dustLedgerEvents") {
+                vec![ledger_event("dustLedgerEvents", 0, "00", 0)]
+            } else {
+                vec![unshielded_progress(0)]
+            }
+        }
+
+        /// A rebuild replays from the chain's first event, whatever the
+        /// cursors say, claims the coins the wallet registered on the way, and
+        /// reports its progress as a first sync does.
+        ///
+        /// The wallet's zswap cursor is past the chain's only event, so a
+        /// replay from the cursors skips it, claims nothing, and keeps the
+        /// cursor.
+        #[tokio::test]
+        async fn a_rebuild_replays_from_the_first_event_and_reports_it() {
+            let mut wallet = wallet(indexer(one_registered_output).await);
+            wallet
+                .commit_shielded_rescan(ShieldedRescanCommit(RescanCommitKind::Ledger9(
+                    crate::ledger_9::ShieldedRescanCommit {
+                        zswap_state: ledger_9::WalletState::new(),
+                        zswap_event_id: 50,
+                    },
+                )))
+                .unwrap();
+            wallet.watch_for_coin(unreachable_coin(5, 42)).unwrap();
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let commit = wallet
+                .resync_plan_from_genesis()
+                .run(Some(tx))
+                .await
+                .expect("the rebuild replays the chain");
+            wallet.commit_resync(commit).unwrap();
+
+            assert_eq!(wallet.sync_cursors().zswap_event_id, 1);
+            let coins = wallet.spendable_shielded_coins();
+            assert_eq!(coins.len(), 1, "the registered coin must be claimed");
+            assert_eq!(coins[0].value, 42);
+            assert_eq!(wallet.ledger_version(), LedgerVersion::V9);
+            let mut reported = Vec::new();
+            while let Ok(update) = rx.try_recv() {
+                reported.push(format!("{update:?}"));
+            }
+            assert!(
+                reported.iter().any(|u| u.starts_with("ZswapComplete")),
+                "the rebuild must report its replay: {reported:?}"
+            );
+        }
+
+        /// A node whose chain holds the block `0xbb…` at every height, so a
+        /// pin to any other block reads as a replaced chain.
+        struct ReplacedChain;
+
+        #[async_trait::async_trait]
+        impl midnight_types::chain_pin::ChainView for ReplacedChain {
+            async fn block_hashes_at(
+                &self,
+                _height: u64,
+            ) -> Option<Vec<midnight_types::BlockHash>> {
+                Some(vec![midnight_types::BlockHash::repeat_byte(0xbb)])
+            }
+
+            async fn finalized_height(&self) -> Option<u64> {
+                Some(9)
+            }
+        }
+
+        /// A replaced chain ends a resync from the cursors, which count the
+        /// events of the chain that is gone. A rebuild from genesis is what
+        /// recovers from it, so it must proceed, and leave the wallet pinned
+        /// to the chain it replayed.
+        #[tokio::test]
+        async fn a_rebuild_proceeds_on_a_replaced_chain_that_a_resync_refuses() {
+            use crate::{LocalWallet, WalletFacade};
+
+            let mut wallet = wallet(indexer(one_registered_output).await);
+            wallet.set_chain_pin(ChainPin {
+                height: 4,
+                hash: format!("{:#x}", midnight_types::BlockHash::repeat_byte(0xaa)),
+            });
+            let wallet = LocalWallet::new(wallet);
+
+            match wallet.resync(&ReplacedChain).await {
+                Err(WalletError::ChainMismatch { .. }) => {}
+                other => {
+                    panic!("a resync from the cursors must refuse a replaced chain, got {other:?}")
+                }
+            }
+            wallet
+                .resync_from_genesis(&ReplacedChain, None)
+                .await
+                .expect("a rebuild replays the chain the node runs now");
+
+            let pin = wallet.inner().read().await.chain_pin().cloned();
+            assert_eq!(
+                pin,
+                Some(ChainPin {
+                    height: 9,
+                    hash: format!("{:#x}", midnight_types::BlockHash::repeat_byte(0xbb)),
+                })
+            );
+            wallet
+                .resync(&ReplacedChain)
+                .await
+                .expect("the rebuilt wallet is on the chain the node runs");
+        }
     }
 
     /// Pointing a stored ledger 9 wallet at a ledger 8 chain, such as a

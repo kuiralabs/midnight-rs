@@ -11,54 +11,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::{Seed, SeedError, Wallet};
-
-/// Progress updates emitted during wallet sync.
-#[derive(Debug, Clone)]
-pub enum SyncProgress {
-    /// The sync resumes from a stored snapshot.
-    Resuming {
-        /// The id of the last zswap event that the snapshot applied.
-        zswap_event_id: i64,
-        /// The id of the last Dust event that the snapshot read.
-        dust_event_id: i64,
-    },
-    /// The zswap replay applied another 10,000 events.
-    ZswapEvents {
-        /// The id of the last zswap event that the replay applied.
-        current: i64,
-        /// The highest zswap event id that the indexer reports.
-        max: i64,
-    },
-    /// The zswap replay reached the highest event id that the indexer
-    /// reports.
-    ZswapComplete {
-        /// The number of zswap events that the replay applied after the last
-        /// hard fork that it crossed, or all of them when it crossed none. It
-        /// is 0 when the wallet was at the tip.
-        events: u64,
-    },
-    /// The Dust replay read another 10,000 new events.
-    DustEvents {
-        /// The id of the last Dust event that the replay read.
-        current: i64,
-        /// The highest Dust event id that the indexer reports.
-        max: i64,
-    },
-    /// The Dust replay reached the highest event id that the indexer reports.
-    DustComplete {
-        /// The number of new Dust events that the replay read, 0 when the
-        /// wallet was at the tip. It includes the events of an earlier ledger
-        /// generation, which the replay skips.
-        events: u64,
-    },
-    /// The unshielded replay reached the last transaction that the indexer
-    /// reports for the wallet's address.
-    UnshieldedCaughtUp {
-        /// The number of unspent UTXOs that the wallet holds at its address.
-        utxos: usize,
-    },
-}
+use crate::{Seed, SeedError, SyncProgress, Wallet};
 
 impl Wallet {
     /// Start a wallet from its seed, written as hex.

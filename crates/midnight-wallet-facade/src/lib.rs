@@ -14,8 +14,9 @@
 //! both, and a build dispatches on [`WalletFacade::ledger_version`].
 //!
 //! An implementation must serialize [`WalletFacade::resync`],
-//! [`WalletFacade::rescan_shielded`], [`WalletFacade::watch_for_coins`] and
-//! [`WalletFacade::forget_coins`] against each other. A resync or a rescan
+//! [`WalletFacade::resync_from_genesis`], [`WalletFacade::rescan_shielded`],
+//! [`WalletFacade::watch_for_coins`] and [`WalletFacade::forget_coins`]
+//! against each other. A resync or a rescan
 //! releases the wallet between what it reads and what it commits. A sync
 //! method that runs in that window can lose its work, or the work of the
 //! other one. No caller holds a lock across them: `MidnightProvider` and every
@@ -29,7 +30,8 @@ use async_trait::async_trait;
 use midnight_types::chain_pin::ChainView;
 use midnight_types::{
     ChainParameters, CoinInfo, CoinPublicKey, EncryptionPublicKey, LedgerVersion, Network,
-    SpendableShieldedCoin, SpentInputs, SyncCursors, TrackedUtxo, WalletBalance, WalletError,
+    ProgressSink, SpendableShieldedCoin, SpentInputs, SyncCursors, TrackedUtxo, WalletBalance,
+    WalletError,
 };
 
 pub mod ledger_8;
@@ -125,6 +127,37 @@ pub trait WalletFacade: Send + Sync {
     /// fresh chain and keep serving the old one's balance. An implementation
     /// that pins its snapshot checks it here and moves it forward afterwards.
     async fn resync(&self, chain: &dyn ChainView) -> Result<(), WalletError>;
+
+    /// Rebuild the wallet's state from the chain's first event, discarding
+    /// the cached state rather than extending it.
+    ///
+    /// The last resort when a [`Self::resync`] cannot clear a state that is
+    /// wrong locally, such as a Dust root the chain rejects. It is what
+    /// deleting the snapshot directory would do, which a running wallet that
+    /// holds that directory cannot do to itself, and it keeps serving reads
+    /// while the replay runs, as a resync does.
+    ///
+    /// The rebuild replays as a first sync does. An indexer that sends no
+    /// events fails it rather than reading as the tip, because the state it
+    /// starts from is empty, and committing that would wipe the wallet. A
+    /// chain the pin says was replaced is not an error here: a rebuild from
+    /// genesis is what recovers from one.
+    ///
+    /// `progress` receives the [`SyncProgress`](midnight_types::SyncProgress)
+    /// events that a first sync reports. The rebuild covers the whole chain,
+    /// and a caller has nothing else to show for that time.
+    ///
+    /// The default runs [`Self::resync`] and reports nothing, so an
+    /// implementation that caches nothing it could rebuild stays correct
+    /// without writing one.
+    async fn resync_from_genesis(
+        &self,
+        chain: &dyn ChainView,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), WalletError> {
+        let _ = progress;
+        self.resync(chain).await
+    }
 
     /// Replay the shielded event stream from its first event and rebuild the
     /// shielded state from it. Dust state, unshielded state, and their cursors
@@ -231,6 +264,14 @@ impl<T: WalletFacade + ?Sized> WalletFacade for Arc<T> {
 
     async fn resync(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
         (**self).resync(chain).await
+    }
+
+    async fn resync_from_genesis(
+        &self,
+        chain: &dyn ChainView,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), WalletError> {
+        (**self).resync_from_genesis(chain, progress).await
     }
 
     async fn rescan_shielded(&self, chain: &dyn ChainView) -> Result<(), WalletError> {

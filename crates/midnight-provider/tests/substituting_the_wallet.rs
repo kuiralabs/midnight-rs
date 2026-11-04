@@ -11,23 +11,26 @@
 //!
 //! No devnet: nothing here reaches the network.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use midnight_provider::{
     Builds, ChainParameters, CoinInfo, CoinPublicKey, EncryptionPublicKey, HashOutput,
-    LedgerVersion, MidnightProvider, Network, Nullifier, ProviderError, ShieldedTokenType,
-    SpendableShieldedCoin, SpentInputs, SyncCursors, TrackedUtxo, TransferRequest, TransferResult,
-    WalletBalance, WalletError, WalletFacade,
+    LedgerVersion, MidnightProvider, Network, Nullifier, ProgressSink, ProviderError,
+    ShieldedTokenType, SpendableShieldedCoin, SpentInputs, SyncCursors, SyncProgress, TrackedUtxo,
+    TransferRequest, TransferResult, WalletBalance, WalletError, WalletFacade,
 };
 use midnight_types::Timestamp;
 use midnight_wallet::chain_pin::ChainView;
 
 /// A wallet that answers the three readings this test makes and refuses the
 /// rest. Everything it refuses would need chain state to answer honestly. It
-/// records the shielded inputs that the provider hands back.
+/// records the shielded inputs that the provider hands back, and which resync
+/// it was asked for: the two do the same here and differ only in which one
+/// the provider reached.
 #[derive(Default)]
 struct StubWallet {
     released: std::sync::Mutex<Vec<Nullifier>>,
+    resyncs: Mutex<Vec<&'static str>>,
 }
 
 #[async_trait::async_trait]
@@ -79,6 +82,19 @@ impl WalletFacade for StubWallet {
     }
 
     async fn resync(&self, _chain: &dyn ChainView) -> Result<(), WalletError> {
+        self.resyncs.lock().unwrap().push("delta");
+        Ok(())
+    }
+
+    async fn resync_from_genesis(
+        &self,
+        _chain: &dyn ChainView,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), WalletError> {
+        self.resyncs.lock().unwrap().push("genesis");
+        if let Some(report) = progress {
+            report(SyncProgress::ZswapComplete { events: 7 });
+        }
         Ok(())
     }
 
@@ -245,4 +261,30 @@ async fn a_reserved_build_whose_connect_fails_gets_its_inputs_back() {
 
     assert!(matches!(err, ProviderError::Rpc(_)), "{err:?}");
     assert_eq!(*wallet.released.lock().unwrap(), vec![nullifier]);
+}
+
+/// The provider holds the wallet as `Arc<dyn WalletFacade>`, so a rebuild
+/// reaches the wallet through the `Arc`'s forwarding. A forward that falls
+/// through to the trait's default runs a resync from the cursors instead,
+/// which replays nothing and reports success.
+#[tokio::test]
+async fn a_genesis_resync_reaches_the_wallets_rebuild_and_its_progress_the_caller() {
+    let wallet = Arc::new(StubWallet::default());
+    let provider = MidnightProvider::new("ws://test").with_wallet(wallet.clone());
+
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let sink = reported.clone();
+    provider
+        .resync_wallet_from_genesis(Some(Arc::new(move |update| {
+            sink.lock().unwrap().push(format!("{update:?}"));
+        })))
+        .await
+        .expect("the stub rebuilds without a chain");
+
+    assert_eq!(*wallet.resyncs.lock().unwrap(), vec!["genesis"]);
+    assert_eq!(
+        *reported.lock().unwrap(),
+        vec!["ZswapComplete { events: 7 }"],
+        "the rebuild's progress must reach the caller that asked for it"
+    );
 }

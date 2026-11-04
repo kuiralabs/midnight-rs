@@ -1313,6 +1313,20 @@ impl Wallet {
             .collect()
     }
 
+    /// Take the in-flight reservations of `previous`, the state this one
+    /// replaces, and drop those past their TTL.
+    ///
+    /// A rebuilt state starts with none, and a build whose transaction is
+    /// still in flight must keep its inputs reserved. A reservation whose
+    /// spend the rebuild already saw names an input the rebuilt state no
+    /// longer holds, so it reserves nothing until its TTL drops it.
+    pub(crate) fn adopt_pending(&mut self, previous: &mut Wallet) {
+        self.pending = std::mem::take(&mut previous.pending);
+        if let Some(bc) = &self.block_context {
+            self.pending.evict_expired(chain_time(bc));
+        }
+    }
+
     /// Where this wallet persists its state, when it persists one.
     pub(crate) fn storage_dir(&self) -> Option<&Path> {
         self.storage_dir.as_deref()
@@ -1511,6 +1525,37 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A wallet with fresh state and no sync, for tests that drive its
+    /// replays against `indexer`.
+    pub(crate) fn offline_wallet(storage_dir: Option<PathBuf>, indexer: IndexerEndpoint) -> Wallet {
+        let seed = crate::wallet::test_support::test_seed();
+        let shielded = ShieldedWallet::<DefaultDB>::default((&seed).into_ledger());
+        let secret_keys = shielded.secret_keys().clone();
+        Wallet {
+            seed: seed.clone(),
+            secret_keys,
+            network: Network::Undeployed,
+            unshielded_address: "mn_addr_undeployed1test".into(),
+            zswap_state: shielded.state.clone(),
+            zswap_event_id: 0,
+            dust_wallet: DustWallet::default(
+                (&seed).into_ledger(),
+                Some(&helpers::INITIAL_PARAMETERS),
+            ),
+            dust_event_id: 0,
+            unshielded_utxos: Vec::new(),
+            last_block_height: 0,
+            last_tx_id: None,
+            chain_pin: None,
+            parameters: helpers::INITIAL_PARAMETERS,
+            block_context: None,
+            pending: PendingReservations::default(),
+            storage_dir,
+            save_failed: false,
+            indexer,
+        }
+    }
+
     /// The hex of this generation's event for an output of `coin` to `seed`'s
     /// wallet that carries no discovery ciphertext. The commitment lands in
     /// the Merkle tree and nothing else identifies the coin, so only a
@@ -1612,29 +1657,7 @@ mod tests {
 
     /// Minimal offline wallet for unit tests: fresh state, no sync.
     fn test_wallet(storage_dir: Option<PathBuf>) -> Wallet {
-        let seed = test_seed();
-        let shielded = ShieldedWallet::<DefaultDB>::default((&seed).into_ledger());
-        let secret_keys = shielded.secret_keys().clone();
-        Wallet {
-            seed: seed.clone(),
-            secret_keys,
-            network: Network::Undeployed,
-            unshielded_address: "mn_addr_undeployed1test".into(),
-            zswap_state: shielded.state.clone(),
-            zswap_event_id: 0,
-            dust_wallet: DustWallet::default((&seed).into_ledger(), Some(&INITIAL_PARAMETERS)),
-            dust_event_id: 0,
-            unshielded_utxos: Vec::new(),
-            last_block_height: 0,
-            last_tx_id: None,
-            chain_pin: None,
-            parameters: INITIAL_PARAMETERS,
-            block_context: None,
-            pending: PendingReservations::default(),
-            storage_dir,
-            save_failed: false,
-            indexer: "http://indexer.invalid".into(),
-        }
+        super::test_support::offline_wallet(storage_dir, "http://indexer.invalid".into())
     }
 
     fn block_with_params(ledger_parameters: Option<String>) -> midnight_indexer_client::Block {
@@ -1963,6 +1986,42 @@ mod tests {
                 .map(|bc| bc.tblock),
             Some(Timestamp::from_secs(1_234)),
             "funding must re-anchor the context on its own chain view"
+        );
+    }
+
+    /// A rebuild replaces the state, not the builds in flight: a reservation
+    /// the replaced state held still reserves its input, and one past its
+    /// TTL goes.
+    #[test]
+    fn a_rebuilt_state_keeps_the_live_reservations_of_the_state_it_replaces() {
+        let mut previous = test_wallet(None);
+        let reserved_at = Timestamp::from_secs(100);
+        previous.reserve_pending(
+            Vec::new(),
+            vec![ukey(0xab, 0)],
+            Vec::new(),
+            reserved_at,
+            Timestamp::MAX,
+        );
+        previous.reserve_pending(
+            Vec::new(),
+            vec![ukey(0xcd, 0)],
+            Vec::new(),
+            reserved_at,
+            Timestamp::from_secs(200),
+        );
+        let mut rebuilt = test_wallet(None);
+        let now = Timestamp::from_secs(1_000);
+        rebuilt.block_context = Some(helpers::make_block_context(now, Default::default(), now));
+
+        rebuilt.adopt_pending(&mut previous);
+
+        let reserved: Vec<SpentUtxoKey> = rebuilt.reserved_unshielded_keys().cloned().collect();
+        assert_eq!(reserved, vec![ukey(0xab, 0)]);
+        assert_eq!(
+            rebuilt.pending.unshielded_spends().count(),
+            1,
+            "the expired reservation must be dropped, not kept"
         );
     }
 

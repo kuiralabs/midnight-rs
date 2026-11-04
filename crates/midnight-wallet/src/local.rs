@@ -9,10 +9,12 @@ use async_trait::async_trait;
 use midnight_types::chain_pin::{ChainView, current_pin};
 use midnight_types::{
     ChainParameters, CoinInfo, CoinPublicKey, EncryptionPublicKey, LedgerVersion, Network,
-    SpendableShieldedCoin, SpentInputs, SyncCursors, TrackedUtxo, WalletBalance, WalletError,
+    ProgressSink, SpendableShieldedCoin, SpentInputs, SyncCursors, TrackedUtxo, WalletBalance,
+    WalletError,
 };
 use midnight_wallet_facade::{IntoWalletFacade, WalletFacade};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
+use tracing::warn;
 
 use crate::Wallet;
 use crate::background::{self, BackgroundSync};
@@ -125,6 +127,21 @@ impl LocalWallet {
 
     /// [`WalletFacade::resync`], for a caller that holds `self.sync`.
     async fn resync_held(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
+        self.resync_with(chain, ResyncDepth::Delta, None).await
+    }
+
+    /// A resync of `depth`, for a caller that holds `self.sync`.
+    ///
+    /// One body for both depths, because the parts that are easy to get
+    /// wrong are the same for each: the replacement pin is taken before the
+    /// check, and the wallet lock is held only around the plan and the
+    /// commit.
+    async fn resync_with(
+        &self,
+        chain: &dyn ChainView,
+        depth: ResyncDepth,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), WalletError> {
         let (pin, snapshot) = {
             let wallet = self.inner.read().await;
             (wallet.chain_pin().cloned(), wallet.snapshot_dir())
@@ -139,14 +156,41 @@ impl LocalWallet {
         };
 
         if let Some(pin) = &pin {
-            require_same_chain(chain, pin, snapshot.as_deref()).await?;
+            match require_same_chain(chain, pin, snapshot.as_deref()).await {
+                // A replaced chain ends a resync from the cursors, which
+                // count the events of the chain that is gone. A rebuild from
+                // genesis replays the chain the node runs now, so it is the
+                // cure for one.
+                Err(WalletError::ChainMismatch { .. }) if depth == ResyncDepth::Genesis => {
+                    warn!("the chain was replaced; rebuilding the wallet from the new chain");
+                }
+                result => result?,
+            }
         }
 
         // The plan is snapshotted under a read lock and the commit applied
         // under a write one, so the replay in between runs with the wallet
         // free.
-        let plan = self.inner.read().await.resync_plan();
-        let commit = plan.run().await?;
+        let plan = match depth {
+            ResyncDepth::Delta => self.inner.read().await.resync_plan(),
+            ResyncDepth::Genesis => self.inner.read().await.resync_plan_from_genesis(),
+        };
+        let commit = match progress {
+            None => plan.run(None).await?,
+            // The replay reports into a channel, drained here into the sink
+            // as it runs. The drain ends when the replay drops the last
+            // sender, which it does by returning, so the join cannot hang.
+            Some(sink) => {
+                let (tx, mut rx) = mpsc::channel(64);
+                let drain = async {
+                    while let Some(update) = rx.recv().await {
+                        sink(update);
+                    }
+                };
+                let (commit, ()) = tokio::join!(plan.run(Some(tx)), drain);
+                commit?
+            }
+        };
         self.inner.write().await.commit_resync(commit)?;
 
         // Move the pin forward with the commit, so a wallet that runs for a
@@ -185,6 +229,15 @@ impl LocalWallet {
         let commit = plan.run().await?;
         self.inner.write().await.commit_shielded_rescan(commit)
     }
+}
+
+/// How much of the wallet a resync rebuilds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResyncDepth {
+    /// Extend the state from its cursors.
+    Delta,
+    /// Discard the state and replay every event from genesis.
+    Genesis,
 }
 
 impl std::fmt::Debug for LocalWallet {
@@ -247,6 +300,16 @@ impl WalletFacade for LocalWallet {
     async fn resync(&self, chain: &dyn ChainView) -> Result<(), WalletError> {
         let _sync = self.sync.lock().await;
         self.resync_held(chain).await
+    }
+
+    async fn resync_from_genesis(
+        &self,
+        chain: &dyn ChainView,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), WalletError> {
+        let _sync = self.sync.lock().await;
+        self.resync_with(chain, ResyncDepth::Genesis, progress)
+            .await
     }
 
     async fn rescan_shielded(&self, chain: &dyn ChainView) -> Result<(), WalletError> {

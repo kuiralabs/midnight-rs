@@ -20,8 +20,8 @@ use crate::{
 use midnight_private_state::PrivateStateProvider;
 use midnight_types::{
     BlockHash, ChainParameters, CoinInfo, CoinPublicKey, EncryptionPublicKey, LedgerVersion,
-    Network, ShieldedTokenType, SpendableShieldedCoin, SpentInputs, SyncCursors, TrackedUtxo,
-    TransferRequest, TransferResult, UnshieldedTokenType, WalletBalance,
+    Network, ProgressSink, ShieldedTokenType, SpendableShieldedCoin, SpentInputs, SyncCursors,
+    TrackedUtxo, TransferRequest, TransferResult, UnshieldedTokenType, WalletBalance,
 };
 use midnight_wallet_facade::{IntoWalletFacade, WalletFacade};
 
@@ -390,6 +390,35 @@ impl MidnightProvider {
         // The wallet resumes against its own indexer and checks its own chain
         // pin; this provider is only the node view those checks ask.
         wallet.resync(self).await?;
+        Ok(())
+    }
+
+    /// Rebuild the attached wallet from the chain's first event, the last
+    /// resort when [`Self::resync_wallet`] does not clear a rejection that
+    /// the wallet's own state causes, or when the chain was replaced.
+    ///
+    /// The wallet replays every stream as a first sync does and reports the
+    /// same [`SyncProgress`](midnight_types::SyncProgress) events to
+    /// `progress`. Reads keep completing with the old state until the
+    /// rebuild commits. An indexer that stops sending events fails the
+    /// rebuild, and the wallet keeps its old state. See
+    /// [`WalletFacade::resync_from_genesis`].
+    ///
+    /// Returns [`ProviderError::NoWallet`] if no wallet is attached.
+    pub async fn resync_wallet_from_genesis(
+        &self,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), ProviderError> {
+        // Boxed for the reason `resync_wallet` is.
+        Box::pin(self.resync_wallet_from_genesis_inner(progress)).await
+    }
+
+    async fn resync_wallet_from_genesis_inner(
+        &self,
+        progress: Option<ProgressSink>,
+    ) -> Result<(), ProviderError> {
+        let wallet = &self.attached()?.facade;
+        wallet.resync_from_genesis(self, progress).await?;
         Ok(())
     }
 
