@@ -280,6 +280,8 @@ impl WalletBuilder {
     /// balance. To catch this, the sync checks a stored snapshot's pin
     /// against the node before the replay starts. A pin that the chain no
     /// longer holds fails the sync with [`WalletError::ChainMismatch`].
+    /// A snapshot with no pin cannot show which chain it came from, so a
+    /// sync that takes a fresh pin syncs from genesis instead of resuming it.
     ///
     /// A node that cannot answer does not fail the pin check, because a
     /// pruned archive must not condemn a healthy wallet. The synced wallet

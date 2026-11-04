@@ -999,6 +999,9 @@ pub(crate) struct ChainSync<'a> {
 
 /// One sync attempt: read the chain's generation, load the snapshot in its
 /// own generation, and sync on the chain.
+///
+/// A sync that carries a fresh pin discards a snapshot that carries none and
+/// syncs from genesis. See [`discard_unpinned_snapshot`].
 async fn sync_once(
     sync: ChainSync<'_>,
     progress: Option<mpsc::Sender<SyncProgress>>,
@@ -1012,6 +1015,16 @@ async fn sync_once(
         Some(dir) => load_snapshot(dir, sync.network.as_str(), &wallet_id, chain)?,
         None => None,
     };
+    let snapshot = snapshot.filter(|(_, stored_pin)| {
+        let discard = discard_unpinned_snapshot(sync.chain_pin.is_some(), stored_pin.is_some());
+        if discard {
+            warn!(
+                "the cached state carries no chain pin, so nothing shows it belongs to this \
+                 chain; discarding it and syncing from genesis"
+            );
+        }
+        !discard
+    });
     let (start, sync) = match snapshot {
         Some((resume, stored_pin)) => {
             info!(
@@ -1047,6 +1060,26 @@ async fn sync_once(
         ),
     };
     sync_on_chain(sync, &block, start, progress).await
+}
+
+/// Whether a sync discards a snapshot rather than resume from it.
+///
+/// Only a snapshot's pin says which chain counted its cursors. The cursors
+/// cannot say it themselves: a replaced chain restarts its event ids at 0 and
+/// climbs to the same counts, so a resume reports the dead chain's balance
+/// without complaint. While the new chain is still shorter, the resume is also
+/// stuck: the cursor names an event the chain does not have, the
+/// subscription answers with silence, a resume reads that as the tip, and
+/// every launch saves the same cursors again.
+///
+/// `can_pin` is whether this sync took a fresh pin from its node. Only such a
+/// sync can replace the snapshot with a pinned one, so only it discards. A
+/// sync with no node to ask has nothing better than the snapshot, and an
+/// in-memory or unpinned wallet would otherwise sync from genesis on every
+/// launch. The cost is paid once: the snapshot the sync saves carries the
+/// pin, and from then on the pin check catches a replaced chain.
+fn discard_unpinned_snapshot(can_pin: bool, snapshot_is_pinned: bool) -> bool {
+    can_pin && !snapshot_is_pinned
 }
 
 /// A snapshot, in the generation that wrote it, and the chain pin it
@@ -1389,8 +1422,8 @@ mod tests {
     mod genesis_rebuild_ws {
         use midnight_helpers::ledger_9::midnight_serialize::tagged_serialize;
         use midnight_indexer_client::testutil::{
-            read_http_request, send_json, subscriber_handshake, unshielded_progress,
-            write_json_response,
+            read_http_request, send_json, subscriber_handshake, subscription_variable,
+            unshielded_progress, write_json_response,
         };
         use serde_json::json;
         use tokio::net::TcpStream;
@@ -1399,7 +1432,8 @@ mod tests {
 
         /// What the mock sends on a subscription: the parsed `subscribe`
         /// message in, the `data` of each `next` message out.
-        type Stream = fn(&serde_json::Value) -> Vec<serde_json::Value>;
+        type Stream =
+            std::sync::Arc<dyn Fn(&serde_json::Value) -> Vec<serde_json::Value> + Send + Sync>;
 
         /// The latest block of a ledger 9 chain.
         fn latest_block_body() -> String {
@@ -1422,7 +1456,7 @@ mod tests {
             let (listener, url) = midnight_indexer_client::testutil::bind().await;
             tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
-                    tokio::spawn(serve(socket, stream));
+                    tokio::spawn(serve(socket, stream.clone()));
                 }
             });
             IndexerEndpoint::from(url)
@@ -1469,7 +1503,7 @@ mod tests {
         /// that empty state and wipes the wallet.
         #[tokio::test]
         async fn a_rebuild_reads_a_silent_indexer_as_a_stall_not_the_tip() {
-            let wallet = wallet(indexer(silent).await);
+            let wallet = wallet(indexer(std::sync::Arc::new(silent)).await);
 
             let result = wallet.resync_plan_from_genesis().run(None).await;
 
@@ -1487,7 +1521,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_resync_from_cursors_reads_a_silent_indexer_as_the_tip() {
-            let mut wallet = wallet(indexer(silent).await);
+            let mut wallet = wallet(indexer(std::sync::Arc::new(silent)).await);
             let before = wallet.sync_cursors();
 
             let commit = wallet
@@ -1531,7 +1565,7 @@ mod tests {
         /// cursor.
         #[tokio::test]
         async fn a_rebuild_replays_from_the_first_event_and_reports_it() {
-            let mut wallet = wallet(indexer(one_registered_output).await);
+            let mut wallet = wallet(indexer(std::sync::Arc::new(one_registered_output)).await);
             wallet
                 .commit_shielded_rescan(ShieldedRescanCommit(RescanCommitKind::Ledger9(
                     crate::ledger_9::ShieldedRescanCommit {
@@ -1565,6 +1599,116 @@ mod tests {
             );
         }
 
+        /// A ledger 9 wallet saved under `dir` with zswap cursor 351 and no
+        /// chain pin, as a sync that could not pin saves it.
+        fn store_unpinned_snapshot(dir: &Path, indexer: IndexerEndpoint) -> String {
+            let mut saved = crate::ledger_9::state::test_support::offline_wallet(
+                Some(dir.to_path_buf()),
+                indexer,
+            );
+            saved
+                .commit_shielded_rescan(crate::ledger_9::ShieldedRescanCommit {
+                    zswap_state: ledger_9::WalletState::new(),
+                    zswap_event_id: 351,
+                })
+                .unwrap();
+            assert!(saved.chain_pin().is_none());
+            saved.unshielded_address()
+        }
+
+        /// Sync `address` from the snapshot under `dir`, with `chain_pin` as
+        /// the pin this sync took, and return the zswap cursor of each
+        /// subscription the sync asked for, and the progress it reported.
+        async fn sync_from_snapshot(
+            dir: &Path,
+            chain_pin: Option<ChainPin>,
+        ) -> (Vec<i64>, Vec<String>, State) {
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = asked.clone();
+            let indexer = indexer(std::sync::Arc::new(move |sub: &serde_json::Value| {
+                if sub["payload"]["query"]
+                    .as_str()
+                    .unwrap()
+                    .contains("zswapLedgerEvents")
+                {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(subscription_variable(sub, "id"));
+                }
+                one_registered_output(sub)
+            }))
+            .await;
+            let address = store_unpinned_snapshot(dir, indexer.clone());
+            let (tx, mut rx) = mpsc::channel(64);
+            let state = sync_once(
+                ChainSync {
+                    indexer: &indexer,
+                    seed: &test_seed(),
+                    address: &address,
+                    network: &Network::Undeployed,
+                    storage_dir: Some(dir),
+                    save: true,
+                    chain_pin,
+                },
+                Some(tx),
+            )
+            .await
+            .expect("the sync completes");
+            let mut reported = Vec::new();
+            while let Ok(update) = rx.try_recv() {
+                reported.push(format!("{update:?}"));
+            }
+            let asked = asked.lock().unwrap().clone();
+            (asked, reported, state)
+        }
+
+        /// Nothing in a snapshot with no pin says which chain counted its
+        /// cursors, so a sync that took a pin of its own syncs from genesis.
+        /// Seen on a localnet reset: a wallet resumed at zswap cursor 351 on a
+        /// chain whose highest event was 147, read the silence as the tip, and
+        /// reported no shielded coins on every launch.
+        #[tokio::test]
+        async fn a_sync_that_can_pin_discards_a_snapshot_with_no_pin() {
+            let base = tempfile::TempDir::new().unwrap();
+            let pin = ChainPin {
+                height: 1,
+                hash: format!("{:#x}", midnight_types::BlockHash::repeat_byte(0xbb)),
+            };
+
+            let (asked, reported, state) = sync_from_snapshot(base.path(), Some(pin.clone())).await;
+
+            assert_eq!(asked.first(), Some(&0), "the sync must start at genesis");
+            assert!(
+                !reported.iter().any(|u| u.starts_with("Resuming")),
+                "{reported:?}"
+            );
+            let State::Ledger9(wallet) = state else {
+                panic!("the chain runs ledger 9");
+            };
+            assert_eq!(wallet.sync_cursors().zswap_event_id, 1);
+            let address = wallet.unshielded_address();
+            let saved =
+                Wallet::stored_chain_pin(base.path(), Network::Undeployed, &address).unwrap();
+            assert_eq!(saved, Some(pin), "the snapshot it saves carries the pin");
+        }
+
+        /// A sync with no pin of its own has nothing better than the
+        /// snapshot. Discarding it there would sync an unpinned wallet from
+        /// genesis on every launch.
+        #[tokio::test]
+        async fn a_sync_that_cannot_pin_resumes_a_snapshot_with_no_pin() {
+            let base = tempfile::TempDir::new().unwrap();
+
+            let (asked, reported, _) = sync_from_snapshot(base.path(), None).await;
+
+            assert_eq!(asked.first(), Some(&351), "the sync must resume");
+            assert!(
+                reported.iter().any(|u| u.starts_with("Resuming")),
+                "{reported:?}"
+            );
+        }
+
         /// A node whose chain holds the block `0xbb…` at every height, so a
         /// pin to any other block reads as a replaced chain.
         struct ReplacedChain;
@@ -1591,7 +1735,7 @@ mod tests {
         async fn a_rebuild_proceeds_on_a_replaced_chain_that_a_resync_refuses() {
             use crate::{LocalWallet, WalletFacade};
 
-            let mut wallet = wallet(indexer(one_registered_output).await);
+            let mut wallet = wallet(indexer(std::sync::Arc::new(one_registered_output)).await);
             wallet.set_chain_pin(ChainPin {
                 height: 4,
                 hash: format!("{:#x}", midnight_types::BlockHash::repeat_byte(0xaa)),
