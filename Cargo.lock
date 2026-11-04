@@ -1466,6 +1466,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-probe-inputs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "midnight-core",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "example-shielded-mint"
 version = "0.1.0"
 dependencies = [
