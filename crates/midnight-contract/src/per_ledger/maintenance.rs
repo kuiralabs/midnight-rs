@@ -63,6 +63,7 @@ pub(crate) fn prepare_update(
                 committee,
                 threshold,
             } => single_replace_authority(committee.clone(), *threshold, counter),
+            OpSpec::Retire => single_replace_authority(Vec::new(), 1, counter),
         });
     }
     Ok(MaintenanceUpdate::new(

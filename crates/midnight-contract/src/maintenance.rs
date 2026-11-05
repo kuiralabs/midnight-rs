@@ -245,6 +245,15 @@ impl<'a, P> ContractMaintenance<'a, P> {
         self
     }
 
+    /// Add a step that retires the authority: it installs an empty committee
+    /// at threshold 1, which no set of signatures meets, so no later
+    /// maintenance update can apply and the contract's verifier keys are
+    /// fixed for good. It counts as the update's one replace-authority step.
+    pub fn retire_authority(mut self) -> Self {
+        self.specs.push(OpSpec::Retire);
+        self
+    }
+
     /// Fetch the current authority state, validate the batch (simulating each
     /// step in order), and build the unsigned maintenance update. The returned
     /// [`PreparedMaintenance`] exposes the bytes each committee member signs.
@@ -285,7 +294,7 @@ impl<'a, P> ContractMaintenance<'a, P> {
             .filter_map(|s| match s {
                 OpSpec::Insert { circuit, .. } => Some((circuit.as_str(), true)),
                 OpSpec::Remove { circuit } => Some((circuit.as_str(), false)),
-                OpSpec::Replace { .. } => None,
+                OpSpec::Replace { .. } | OpSpec::Retire => None,
             })
             .collect();
         validate_vk_sequence(&state, &vk_ops)?;
@@ -295,18 +304,23 @@ impl<'a, P> ContractMaintenance<'a, P> {
         // satisfiable.
         let mut replaces = 0usize;
         for spec in &self.specs {
-            if let OpSpec::Replace {
-                committee,
-                threshold,
-            } = spec
-            {
-                replaces += 1;
-                validate_committee(committee, *threshold)?;
+            match spec {
+                OpSpec::Replace {
+                    committee,
+                    threshold,
+                } => {
+                    replaces += 1;
+                    validate_committee(committee, *threshold)?;
+                }
+                OpSpec::Retire => replaces += 1,
+                OpSpec::Insert { .. } | OpSpec::Remove { .. } => {}
             }
         }
         if replaces > 1 {
             return Err(ContractError::Maintenance(
-                "a maintenance update may contain at most one replace_authority".into(),
+                "a maintenance update may contain at most one replace_authority or \
+                 retire_authority"
+                    .into(),
             ));
         }
 
@@ -351,6 +365,8 @@ pub(crate) enum OpSpec {
         committee: Vec<VerifyingKey>,
         threshold: u32,
     },
+    /// An empty committee at threshold 1.
+    Retire,
 }
 
 /// An unsigned (or partially-signed) maintenance update. Collect the committee

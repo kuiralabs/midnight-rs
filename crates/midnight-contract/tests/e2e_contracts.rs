@@ -727,6 +727,51 @@ async fn governance_deploy_then_apply_both_updates() {
     );
     eprintln!("governance: authority rotated on-chain ✓");
 
+    // Retire the authority. The current committee signs its own retirement,
+    // and afterwards no signature can meet the empty committee.
+    contract
+        .maintenance()
+        .retire_authority()
+        .prepare()
+        .await
+        .expect("prepare retire_authority")
+        .sign(0, &new_authority)
+        .await
+        .expect("submit retire_authority")
+        .wait_best()
+        .await
+        .expect("retire_authority included in best block");
+
+    let retired = contract.maintenance_authority().await.unwrap();
+    assert!(
+        retired.committee.is_empty(),
+        "a retired authority has no committee, got {:?}",
+        retired.committee
+    );
+    assert_eq!(
+        retired.threshold, 1,
+        "a retired authority keeps threshold 1"
+    );
+    assert_eq!(retired.counter, 3, "a third maintenance update → counter 3");
+
+    let after = contract
+        .maintenance()
+        .remove_verifier_key("increment")
+        .prepare()
+        .await
+        .expect("an update to a retired contract still prepares")
+        .sign(0, &new_authority)
+        .build()
+        .await;
+    match after {
+        Err(midnight_contract::ContractError::Maintenance(message)) => assert!(
+            message.contains("outside the committee"),
+            "a retired authority must refuse every signer, got {message}"
+        ),
+        other => panic!("a retired authority must refuse every signer, got {other:?}"),
+    }
+    eprintln!("governance: authority retired on-chain ✓");
+
     let pinned = Contract::at(&provider, &address)
         .at_block(batch.block_hash)
         .build()
