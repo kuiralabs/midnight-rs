@@ -11,6 +11,7 @@ mod local_prover;
 pub mod node_error;
 mod proof_providers;
 mod provider;
+pub mod proving_data;
 mod remote_prover;
 mod submit;
 pub mod transfer;
