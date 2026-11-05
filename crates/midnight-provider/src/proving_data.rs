@@ -86,19 +86,40 @@ pub fn wallet_proving_files(max_k: u8) -> io::Result<Vec<ProvingFile>> {
             ),
         ));
     }
-    let keys = |files: &[(&'static str, [u8; 32], &'static str)], generation| {
-        files
-            .iter()
-            .map(move |(name, ..)| ProvingFile {
-                name: (*name).to_owned(),
-                generation,
-            })
-            .collect::<Vec<_>>()
-    };
-    let mut files = keys(ledger_8::ZSWAP_EXPECTED_FILES, Generation::Ledger8);
-    files.extend(keys(ledger_8::DUST_EXPECTED_FILES, Generation::Ledger8));
-    files.extend(keys(ledger_9::ZSWAP_EXPECTED_FILES, Generation::Ledger9));
-    files.extend(keys(ledger_9::DUST_EXPECTED_FILES, Generation::Ledger9));
+    // Generations may share a key: a release candidate can keep the previous
+    // generation's Zswap and Dust keys under the same names. One cache holds one
+    // copy of a name, so a shared name is listed once, and two generations that
+    // expect different bytes under it cannot share a cache at all.
+    let mut files: Vec<ProvingFile> = Vec::new();
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    let generations = [
+        (ledger_8::ZSWAP_EXPECTED_FILES, Generation::Ledger8),
+        (ledger_8::DUST_EXPECTED_FILES, Generation::Ledger8),
+        (ledger_9::ZSWAP_EXPECTED_FILES, Generation::Ledger9),
+        (ledger_9::DUST_EXPECTED_FILES, Generation::Ledger9),
+    ];
+    for (expected, generation) in generations {
+        for (name, hash, _) in expected {
+            match files.iter().position(|f| f.name == *name) {
+                Some(i) if hashes[i] == *hash => {}
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "the linked ledger generations expect different bytes under {name}"
+                        ),
+                    ));
+                }
+                None => {
+                    files.push(ProvingFile {
+                        name: (*name).to_owned(),
+                        generation,
+                    });
+                    hashes.push(*hash);
+                }
+            }
+        }
+    }
     files.extend((MIN_CIRCUIT_K..=max_k).map(|k| ProvingFile {
         name: ledger_9::MidnightDataProvider::name_k(k),
         generation: Generation::Ledger9,
@@ -299,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn both_generations_keys_and_the_parameter_ladder_are_listed() {
+    fn every_linked_key_and_the_parameter_ladder_are_listed_once() {
         let names: Vec<_> = wallet_proving_files(16)
             .unwrap()
             .into_iter()
@@ -313,21 +334,19 @@ mod tests {
         }
         assert!(!names.contains(&"bls_midnight_2p4".to_owned()));
         assert!(!names.contains(&"bls_midnight_2p17".to_owned()));
-        let versions: std::collections::BTreeSet<_> = names
+        let linked = ledger_8::ZSWAP_EXPECTED_FILES
             .iter()
-            .filter(|n| n.starts_with("zswap/"))
-            .map(|n| n.split('/').nth(1).unwrap().to_owned())
-            .collect();
-        assert_eq!(
-            versions.len(),
-            2,
-            "the Zswap keys of both generations: {versions:?}"
-        );
-        assert!(
-            names
-                .iter()
-                .any(|n| n.starts_with("dust/") && n.ends_with("spend.prover"))
-        );
+            .chain(ledger_8::DUST_EXPECTED_FILES)
+            .chain(ledger_9::ZSWAP_EXPECTED_FILES)
+            .chain(ledger_9::DUST_EXPECTED_FILES);
+        for (name, ..) in linked {
+            assert!(
+                names.contains(&(*name).to_owned()),
+                "{name} missing from {names:?}"
+            );
+        }
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "a name listed twice: {names:?}");
     }
 
     #[test]
