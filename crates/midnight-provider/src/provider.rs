@@ -275,16 +275,15 @@ impl MidnightProvider {
     ///
     /// # Errors
     ///
-    /// [`ProviderError::Rpc`] when the node cannot be reached, when the runtime
-    /// returns an error, or when it returns parameters of a generation this
-    /// build does not link.
+    /// [`ProviderError::Rpc`] when the node cannot be reached or the runtime
+    /// returns an error. [`ProviderError::UnsupportedLedger`] when it returns
+    /// parameters of a generation this build does not link.
     pub async fn ledger_version(&self) -> Result<LedgerVersion, ProviderError> {
         let parameters = self
             .call_runtime_api::<Result<Vec<u8>, subxt::dynamic::Value>>("get_ledger_parameters")
             .await?
             .map_err(|e| ProviderError::Rpc(format!("get_ledger_parameters failed: {e}")))?;
-        LedgerVersion::of_ledger_parameters(&parameters)
-            .map_err(|e| ProviderError::Rpc(format!("decoding the ledger parameters: {e}")))
+        ledger_version_of(&parameters)
     }
 
     /// Resync the attached wallet, then hand out its builds for the generation
@@ -1553,8 +1552,25 @@ fn rpc_error(method: &'static str) -> impl FnOnce(subxt::rpcs::Error) -> Provide
     }
 }
 
+/// The generation of the ledger parameters `parameters`, which a chain whose
+/// generation this build does not link fails as [`ProviderError::UnsupportedLedger`].
+fn ledger_version_of(parameters: &[u8]) -> Result<LedgerVersion, ProviderError> {
+    LedgerVersion::of_ledger_parameters(parameters)
+        .map_err(|e| ProviderError::UnsupportedLedger(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
+    /// A caller tells a chain on an unknown generation from a failed read by
+    /// the error's type, not by its wording.
+    #[test]
+    fn parameters_of_an_unknown_generation_are_an_unsupported_ledger() {
+        match super::ledger_version_of(b"not ledger parameters") {
+            Err(ProviderError::UnsupportedLedger(_)) => {}
+            other => panic!("expected UnsupportedLedger, got {other:?}"),
+        }
+    }
+
     use super::*;
     use midnight_indexer_client::testutil;
     use serde_json::{Value, json};

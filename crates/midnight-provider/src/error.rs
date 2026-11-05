@@ -6,6 +6,12 @@ pub enum ProviderError {
     #[error("RPC error: {0}")]
     Rpc(String),
 
+    /// The chain answered with ledger parameters of a generation this build
+    /// does not link, so nothing it builds would decode there. The string is
+    /// the decoder's error.
+    #[error("the chain runs a ledger generation this build does not link: {0}")]
+    UnsupportedLedger(String),
+
     /// An operation requiring a synced wallet was invoked on a provider
     /// without one. Sync a wallet
     /// (`Wallet::from_seed(..)?.sync(&provider, indexer_url)` in
