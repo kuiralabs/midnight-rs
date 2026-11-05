@@ -94,9 +94,10 @@ pub(crate) async fn populate_verifier_keys(
     mut state: ContractState<InMemoryDB>,
     zk_config: &Arc<dyn crate::zk_config::ZkConfigProvider>,
     declared: Option<Vec<String>>,
+    registered: Option<Vec<String>>,
 ) -> Result<ContractState<InMemoryDB>, ContractError> {
     let keys = crate::zk_config::read_blocking(zk_config, move |zk_config| {
-        verifier_keys(zk_config, declared.as_deref())
+        verifier_keys(zk_config, declared.as_deref(), registered.as_deref())
     })
     .await?;
     for (circuit, key) in keys {
@@ -140,6 +141,11 @@ pub(crate) fn verifier_key_version(bytes: &[u8]) -> Result<VerifierKeyVersion, S
 /// compiled `*.verifier` artifact, keyed by circuit id (e.g. the `increment`
 /// circuit → entry point `"increment"`).
 ///
+/// `registered` narrows the deploy to some of the circuits, which must each
+/// be among the contract's circuits; the rest stay out of the deployed state
+/// for a maintenance update to add. The cross-check against the provider
+/// still runs over every circuit.
+///
 /// Required for on-chain deployment — without verifier keys, the node cannot
 /// verify ZK proofs for circuit calls. The provider must be able to enumerate
 /// its circuits ([`ZkConfigProvider::list_circuits`]); a provider that cannot
@@ -149,6 +155,7 @@ pub(crate) fn verifier_key_version(bytes: &[u8]) -> Result<VerifierKeyVersion, S
 pub(crate) fn verifier_keys(
     zk_config: &dyn crate::zk_config::ZkConfigProvider,
     declared: Option<&[String]>,
+    registered: Option<&[String]>,
 ) -> Result<Vec<(String, Vec<u8>)>, ContractError> {
     let enumerated = zk_config
         .list_circuits()
@@ -185,6 +192,18 @@ pub(crate) fn verifier_keys(
                  provider (e.g. FsZkConfigProvider) or a contract that declares its circuits"
                     .into(),
             ));
+        }
+    };
+
+    let circuits = match registered {
+        None => circuits,
+        Some(registered) => {
+            if let Some(unknown) = registered.iter().find(|r| !circuits.contains(r)) {
+                return Err(ContractError::Construction(format!(
+                    "the deploy registers `{unknown}`, which is not a circuit of the contract"
+                )));
+            }
+            registered.to_vec()
         }
     };
 
@@ -272,7 +291,7 @@ mod tests {
         let zk_config: Arc<dyn crate::zk_config::ZkConfigProvider> = Arc::new(
             crate::zk_config::FsZkConfigProvider::new(counter_compiled_dir()),
         );
-        let mut state = populate_verifier_keys(ContractState::default(), &zk_config, None)
+        let mut state = populate_verifier_keys(ContractState::default(), &zk_config, None, None)
             .await
             .unwrap();
         let increment = verifier_key_file("counter", "increment");
@@ -320,7 +339,7 @@ mod tests {
     #[test]
     fn verifier_keys_loads_increment() {
         let provider = crate::zk_config::FsZkConfigProvider::new(counter_compiled_dir());
-        let keys = verifier_keys(&provider, None).unwrap();
+        let keys = verifier_keys(&provider, None, None).unwrap();
 
         let (_, key) = keys
             .iter()
@@ -343,7 +362,7 @@ mod tests {
     #[test]
     fn missing_keys_directory_is_an_error_not_an_empty_deploy() {
         let provider = crate::zk_config::FsZkConfigProvider::new("/nonexistent/compiledd");
-        let err = verifier_keys(&provider, None)
+        let err = verifier_keys(&provider, None, None)
             .expect_err("a nonexistent artifact directory must not deploy silently");
         let msg = err.to_string();
         assert!(
@@ -362,7 +381,7 @@ mod tests {
             "increment_by".to_string(),
             "decrement".to_string(),
         ];
-        let err = verifier_keys(&provider, Some(&declared))
+        let err = verifier_keys(&provider, Some(&declared), None)
             .expect_err("a declared circuit with no verifier key must be rejected");
         let msg = err.to_string();
         assert!(
@@ -377,7 +396,7 @@ mod tests {
     fn key_file_not_declared_by_the_contract_is_rejected() {
         let provider = crate::zk_config::FsZkConfigProvider::new(counter_compiled_dir());
         let declared = vec!["increment".to_string()];
-        let err = verifier_keys(&provider, Some(&declared))
+        let err = verifier_keys(&provider, Some(&declared), None)
             .expect_err("an undeclared key file must be rejected");
         let msg = err.to_string();
         assert!(
@@ -386,11 +405,34 @@ mod tests {
         );
     }
 
+    /// A deploy in waves registers some circuits and leaves the rest to a
+    /// maintenance update, while the full directory still passes the
+    /// stale-artifact check.
+    #[test]
+    fn a_registered_subset_deploys_only_its_keys() {
+        let provider = crate::zk_config::FsZkConfigProvider::new(counter_compiled_dir());
+        let declared = vec!["increment".to_string(), "increment_by".to_string()];
+        let registered = vec!["increment_by".to_string()];
+        let keys = verifier_keys(&provider, Some(&declared), Some(&registered)).unwrap();
+        assert_eq!(
+            keys.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+            ["increment_by"]
+        );
+
+        let err = verifier_keys(&provider, Some(&declared), Some(&["decrement".to_string()]))
+            .expect_err("a registered circuit the contract lacks must be rejected");
+        assert!(err.to_string().contains("decrement"), "{err}");
+
+        let stale = verifier_keys(&provider, Some(&registered), Some(&registered))
+            .expect_err("the stale-artifact check still covers the whole directory");
+        assert!(stale.to_string().contains("increment"), "{stale}");
+    }
+
     #[test]
     fn declared_set_matching_the_directory_populates_every_circuit() {
         let provider = crate::zk_config::FsZkConfigProvider::new(counter_compiled_dir());
         let declared = vec!["increment".to_string(), "increment_by".to_string()];
-        let keys = verifier_keys(&provider, Some(&declared)).unwrap();
+        let keys = verifier_keys(&provider, Some(&declared), None).unwrap();
         for circuit in &declared {
             assert!(
                 keys.iter().any(|(c, _)| c == circuit),

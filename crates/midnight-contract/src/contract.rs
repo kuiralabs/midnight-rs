@@ -509,6 +509,7 @@ pub struct DeployBuilder<'a, P> {
     shielded_offer: Option<crate::ShieldedOffer>,
     maintenance_authority: Option<(Vec<VerifyingKey>, u32)>,
     declared_circuits: Option<Vec<String>>,
+    registered_circuits: Option<Vec<String>>,
     declares_witnesses: bool,
 }
 
@@ -526,6 +527,7 @@ impl<'a, P> DeployBuilder<'a, P> {
             shielded_offer: None,
             maintenance_authority: None,
             declared_circuits: None,
+            registered_circuits: None,
             declares_witnesses: false,
         }
     }
@@ -550,6 +552,22 @@ impl<'a, P> DeployBuilder<'a, P> {
         circuits: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.declared_circuits = Some(circuits.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Register only `circuits` of the contract's circuits, and leave the
+    /// others' entry points out of the deployed state.
+    ///
+    /// For a contract whose verifier keys do not fit one deploy: register a
+    /// first wave here under a maintenance authority
+    /// ([`Self::with_maintenance_authority`]), then add the rest with
+    /// [`ContractMaintenance::insert_verifier_key`](crate::ContractMaintenance::insert_verifier_key).
+    /// Each circuit must be one the artifact directory holds a key for.
+    pub fn with_registered_circuits(
+        mut self,
+        circuits: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.registered_circuits = Some(circuits.into_iter().map(Into::into).collect());
         self
     }
 
@@ -741,7 +759,13 @@ where
         let store = provider.private_state();
         require_store_for_private_state(&private_state, store.is_some())?;
 
-        let mut state = populate_verifier_keys(state, &zk_config, self.declared_circuits).await?;
+        let mut state = populate_verifier_keys(
+            state,
+            &zk_config,
+            self.declared_circuits,
+            self.registered_circuits,
+        )
+        .await?;
 
         // Stamp the maintenance authority committee into the deployed state, if
         // requested. No signing key is stored — members sign ops externally.
