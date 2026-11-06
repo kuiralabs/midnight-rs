@@ -242,7 +242,15 @@ impl<'a> Context<'a> {
             StorageKind::Counter => {}
             StorageKind::Map => {
                 field.key = Some(arg_ty(0)?);
-                field.value = Some(arg_ty(1)?);
+                // A map of containers, such as one approval set per proposal:
+                // the value is the nested container's type.
+                field.value = Some(match &args[1] {
+                    ir::AdtArg::Type(t @ ir::Type::Adt { .. }) => {
+                        check_adt_default(t)?;
+                        t.clone()
+                    }
+                    _ => arg_ty(1)?,
+                });
             }
             StorageKind::MerkleTree | StorageKind::HistoricMerkleTree => {
                 field.depth = Some(arg_nat(0)?);
@@ -254,6 +262,41 @@ impl<'a> Context<'a> {
 }
 
 // -- free helpers -------------------------------------------------------
+
+/// The ADTs whose default the interpreter can push as a ledger state value: an
+/// empty map.
+const PUSHABLE_ADT_DEFAULTS: &[&str] = &["Map"];
+
+/// Check a pushed `(state-value ADT x t)`. When `t` is a value type, `x` is a
+/// value of it. When `t` is itself an ADT, the push nests a container, which
+/// the interpreter can build only from that container's default.
+fn check_adt_state_value(x: &ir::Operand, t: &ir::Type) -> Result<(), ArtifactError> {
+    if !matches!(t, ir::Type::Adt { .. }) {
+        return check_operand(x).and_then(|()| check_type(t));
+    }
+    match x {
+        ir::Operand::Expr(e) if matches!(e.as_ref(), ir::Expr::Default(d) if d == t) => {
+            check_adt_default(t)
+        }
+        _ => unsupported(&format!("a nested {t:?} that is not its default")),
+    }
+}
+
+/// Refuse the default of an ADT the interpreter cannot push, or whose element
+/// types hold a construct it cannot execute.
+fn check_adt_default(t: &ir::Type) -> Result<(), ArtifactError> {
+    let ir::Type::Adt { name, args } = t else {
+        return check_type(t);
+    };
+    if !PUSHABLE_ADT_DEFAULTS.contains(&name.as_str()) {
+        return unsupported(&format!("the default of ADT {name} as a ledger value"));
+    }
+    args.iter().try_for_each(|arg| match arg {
+        ir::AdtArg::Type(inner @ ir::Type::Adt { .. }) => check_adt_default(inner),
+        ir::AdtArg::Type(inner) => check_type(inner),
+        ir::AdtArg::Nat(_) => Ok(()),
+    })
+}
 
 /// Refuse a type no consumer can handle, naming it, so that a bad artifact
 /// fails at load and not mid-execution.
@@ -484,7 +527,13 @@ fn check_expr(e: &ir::Expr) -> Result<(), ArtifactError> {
                     check_expr(expr)
                 }
             })?;
-            each(a)?;
+            // An argument that is a container's default, as in `m.insert(k,
+            // default<Map<K, V>>)`, only types the operation: the instructions
+            // push the container itself as a state value.
+            a.iter().try_for_each(|arg| match arg {
+                ir::Expr::Default(t @ ir::Type::Adt { .. }) => check_adt_default(t),
+                _ => check_expr(arg),
+            })?;
             check_instructions(instructions)
         }
     }
@@ -509,7 +558,7 @@ fn check_operand(o: &ir::Operand) -> Result<(), ArtifactError> {
         AlignedConcat(xs) | List(xs) => xs.iter().try_for_each(check_operand),
         StateValue(sv) => match sv {
             ir::StateValue::Cell(x) => check_operand(x),
-            ir::StateValue::Adt(x, t) => check_operand(x).and_then(|()| check_type(t)),
+            ir::StateValue::Adt(x, t) => check_adt_state_value(x, t),
             ir::StateValue::Array(xs) => xs.iter().try_for_each(check_operand),
             ir::StateValue::Map(entries) | ir::StateValue::MerkleTree { entries, .. } => entries
                 .iter()

@@ -2067,8 +2067,23 @@ fn push_value(
                 })?;
                 return Ok(StateValue::BoundedMerkleTree(MerkleTree::blank(height)));
             }
+            // A container's default inserted into another container, as in
+            // `m.insert(k, default<Map<K, V>>)`: an empty map. The artifact
+            // loader refuses the default of any other ADT.
+            ir::StateValue::Adt(inner, ty) => {
+                if let (ir::Operand::Expr(e), ir::Type::Adt { name, .. }) = (inner.as_ref(), ty)
+                    && matches!(e.as_ref(), ir::Expr::Default(_))
+                {
+                    return match name.as_str() {
+                        "Map" => Ok(StateValue::Map(StorageHashMap::new())),
+                        other => Err(InterpreterError::Unsupported(format!(
+                            "push of the default of ADT {other}"
+                        ))),
+                    };
+                }
+            }
             // Scalar shapes: `reduce_operand` below unwraps them.
-            ir::StateValue::Null | ir::StateValue::Cell(_) | ir::StateValue::Adt(..) => {}
+            ir::StateValue::Null | ir::StateValue::Cell(_) => {}
         }
     }
     match reduce_operand(o) {
