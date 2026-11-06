@@ -168,12 +168,20 @@ impl<'a> Builds<'a> {
         let mut held = HeldInputs::of(SpentInputs::default(), self.provider.facade());
         let mut prepared = Vec::with_capacity(draws.len());
         for &(token_type, amount) in draws {
-            let (draw, spent) = self
+            match self
                 .wallet
                 .spend_unshielded(context, token_type, amount)
-                .await?;
-            held.absorb(spent);
-            prepared.push(draw);
+                .await
+            {
+                Ok((draw, spent)) => {
+                    held.absorb(spent);
+                    prepared.push(draw);
+                }
+                Err(e) => {
+                    held.release().await;
+                    return Err(e.into());
+                }
+            }
         }
         Ok((prepared, held))
     }

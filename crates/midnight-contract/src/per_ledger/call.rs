@@ -66,14 +66,16 @@ fn payouts_of(transcript: Option<&Transcript<DefaultDB>>) -> Vec<UtxoOutputInfo<
         .collect()
 }
 
-/// What a transcript takes from its caller with `receiveUnshielded`, by
-/// token.
+/// What a transcript's caller must fund in unshielded tokens, by token.
 ///
-/// A contract that mints a token to itself also records receiving it, and the
-/// mint, not the caller, supplies that value; so each token's mints to the
-/// contract come off what it receives. The caller funds the rest with UTXOs in
-/// the transcript's own segment, since the ledger balances every (token,
-/// segment) on its own. Dust never moves this way.
+/// The ledger balances each (token, segment) as mints + what the contract
+/// sends out (`unshielded_outputs`) + the offer's inputs − what the contract
+/// takes in (`unshielded_inputs`) − the offer's outputs, which include a payout
+/// to every user the transcript claims a spend for. Whatever that leaves short
+/// the caller funds with UTXOs in the transcript's own segment. So a mint or a
+/// send to the contract itself, which records an input beside its mint or
+/// output, costs the caller nothing, and a payout the contract funds from a
+/// mint costs it nothing either. Dust never moves this way.
 fn deposits_of(
     transcript: Option<&Transcript<DefaultDB>>,
     contract: ContractAddress,
@@ -82,23 +84,37 @@ fn deposits_of(
         return Vec::new();
     };
     let effects = &transcript.effects;
-    let minted = |token_type: UnshieldedTokenType| -> u128 {
-        effects
-            .unshielded_mints
-            .iter()
-            .filter(|kv| contract.custom_unshielded_token_type(*kv.0) == token_type)
-            .map(|kv| u128::from(*kv.1))
-            .sum()
-    };
-    effects
-        .unshielded_inputs
-        .iter()
-        .filter_map(|kv| match *kv.0 {
-            TokenType::Unshielded(token_type) => {
-                let owed = kv.1.saturating_sub(minted(token_type));
-                (owed > 0).then_some((token_type, owed))
-            }
-            _ => None,
+    let mut need: std::collections::BTreeMap<UnshieldedTokenType, u128> = Default::default();
+    let mut have: std::collections::BTreeMap<UnshieldedTokenType, u128> = Default::default();
+    let add =
+        |map: &mut std::collections::BTreeMap<UnshieldedTokenType, u128>, token, value: u128| {
+            let entry = map.entry(token).or_default();
+            *entry = entry.saturating_add(value);
+        };
+    for kv in effects.unshielded_inputs.iter() {
+        if let TokenType::Unshielded(token) = *kv.0 {
+            add(&mut need, token, *kv.1);
+        }
+    }
+    for payout in payouts_of(Some(transcript)) {
+        add(&mut need, payout.token_type, payout.value);
+    }
+    for kv in effects.unshielded_outputs.iter() {
+        if let TokenType::Unshielded(token) = *kv.0 {
+            add(&mut have, token, *kv.1);
+        }
+    }
+    for kv in effects.unshielded_mints.iter() {
+        add(
+            &mut have,
+            contract.custom_unshielded_token_type(*kv.0),
+            u128::from(*kv.1),
+        );
+    }
+    need.into_iter()
+        .filter_map(|(token, needed)| {
+            let owed = needed.saturating_sub(have.get(&token).copied().unwrap_or_default());
+            (owed > 0).then_some((token, owed))
         })
         .collect()
 }
@@ -324,60 +340,9 @@ pub(crate) async fn call_transaction(
     // who pays. The payer joins here.
     builds.add_funding(&context).await?;
 
-    // The value the circuit takes from its caller comes from the payer's
-    // UTXOs, reserved under one guard until the call reaches the chain. Each
-    // segment's draws ride that segment's offer, with their change.
-    let draws: Vec<_> = guaranteed_deposits
-        .iter()
-        .chain(&fallible_deposits)
-        .copied()
-        .collect();
-    let (mut guaranteed_drawn, unshielded_held) =
-        builds.prepare_unshielded_inputs(&context, &draws).await?;
-    let fallible_drawn = guaranteed_drawn.split_off(guaranteed_deposits.len());
-
-    // The contract's own balance funds a payout, so a payout adds an output and
-    // spends nothing. A deposit adds the payer's spends and their change.
-    let offer = |payouts: Vec<UtxoOutputInfo<UnshieldedWallet>>, drawn: Vec<PreparedUnshielded>| {
-        let mut inputs: Vec<Box<dyn BuildUtxoSpend<DefaultDB, BuildContext>>> = Vec::new();
-        let mut outputs: Vec<Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>> = payouts
-            .into_iter()
-            .map(|p| Box::new(p) as Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>)
-            .collect();
-        for draw in drawn {
-            inputs.extend(
-                draw.inputs
-                    .into_iter()
-                    .map(|i| Box::new(i) as Box<dyn BuildUtxoSpend<DefaultDB, BuildContext>>),
-            );
-            outputs.extend(
-                draw.change
-                    .map(|c| Box::new(c) as Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>),
-            );
-        }
-        (!inputs.is_empty() || !outputs.is_empty()).then(|| UnshieldedOfferInfo { inputs, outputs })
-    };
-
-    let keys_of = |drawn: &[PreparedUnshielded]| -> Vec<TransactionSigningKey> {
-        drawn
-            .iter()
-            .flat_map(|d| d.inputs.iter().map(|i| i.signing_key().clone()))
-            .collect()
-    };
-    let unshielded_keys = UnshieldedKeys {
-        guaranteed: keys_of(&guaranteed_drawn),
-        fallible: keys_of(&fallible_drawn),
-    };
-
-    let intent_info: IntentInfo<DefaultDB, BuildContext> = IntentInfo {
-        guaranteed_unshielded_offer: offer(guaranteed_payouts, guaranteed_drawn),
-        fallible_unshielded_offer: offer(fallible_payouts, fallible_drawn),
-        actions: vec![Box::new(call_action)],
-    };
     let build_context = context.clone();
     let mut tx_info =
         StandardTransactionInfo::new_from_context(context, builds.proof_provider(), None);
-    tx_info.add_intent(INTENT_SEGMENT, Box::new(intent_info));
     // Attach a Zswap output for every coin the circuit created via
     // `createZswapOutput` (shielded mints/sends). Each carries the circuit's
     // exact coin, and a discovery ciphertext when `build_shielded_offer_outputs`
@@ -478,21 +443,79 @@ pub(crate) async fn call_transaction(
         circuit_output_value,
         minted_value,
     };
+    // The caller's unshielded value is drawn last, after every check that can
+    // refuse the call, and inside the shielded guard, so a failure from here on
+    // hands both reservations back before the error returns.
     let pinned = held.spent().clone();
-    let unshielded_pinned = unshielded_held.spent().clone();
-    let mut transaction = unshielded_held
-        .keep_on_ok(held.keep_on_ok(attach_and_prove(
-            builds,
-            tx_info,
-            circuit_offers,
-            prepared,
-            (change_cpk, change_epk),
-            &unshielded_keys,
-            pay_fees,
-        )))
+    let mut transaction = held
+        .keep_on_ok(async move {
+            // The value the circuit takes from its caller comes from the payer's
+            // UTXOs, reserved under one guard until the call reaches the chain. Each
+            // segment's draws ride that segment's offer, with their change.
+            let draws: Vec<_> = guaranteed_deposits
+                .iter()
+                .chain(&fallible_deposits)
+                .copied()
+                .collect();
+            let (mut guaranteed_drawn, unshielded_held) = builds
+                .prepare_unshielded_inputs(&build_context, &draws)
+                .await?;
+            let fallible_drawn = guaranteed_drawn.split_off(guaranteed_deposits.len());
+
+            // The contract's own balance funds a payout, so a payout adds an output and
+            // spends nothing. A deposit adds the payer's spends and their change.
+            let offer = |payouts: Vec<UtxoOutputInfo<UnshieldedWallet>>,
+                         drawn: Vec<PreparedUnshielded>| {
+                let mut inputs: Vec<Box<dyn BuildUtxoSpend<DefaultDB, BuildContext>>> = Vec::new();
+                let mut outputs: Vec<Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>> = payouts
+                    .into_iter()
+                    .map(|p| Box::new(p) as Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>)
+                    .collect();
+                for draw in drawn {
+                    inputs.extend(
+                        draw.inputs.into_iter().map(|i| {
+                            Box::new(i) as Box<dyn BuildUtxoSpend<DefaultDB, BuildContext>>
+                        }),
+                    );
+                    outputs.extend(
+                        draw.change.map(|c| {
+                            Box::new(c) as Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>
+                        }),
+                    );
+                }
+                (!inputs.is_empty() || !outputs.is_empty())
+                    .then(|| UnshieldedOfferInfo { inputs, outputs })
+            };
+
+            let unshielded_keys: Vec<TransactionSigningKey> = guaranteed_drawn
+                .iter()
+                .chain(&fallible_drawn)
+                .flat_map(|d| d.inputs.iter().map(|i| i.signing_key().clone()))
+                .collect();
+
+            let intent_info: IntentInfo<DefaultDB, BuildContext> = IntentInfo {
+                guaranteed_unshielded_offer: offer(guaranteed_payouts, guaranteed_drawn),
+                fallible_unshielded_offer: offer(fallible_payouts, fallible_drawn),
+                actions: vec![Box::new(call_action)],
+            };
+            tx_info.add_intent(INTENT_SEGMENT, Box::new(intent_info));
+            let unshielded_pinned = unshielded_held.spent().clone();
+            let mut transaction = unshielded_held
+                .keep_on_ok(attach_and_prove(
+                    builds,
+                    tx_info,
+                    circuit_offers,
+                    prepared,
+                    (change_cpk, change_epk),
+                    &unshielded_keys,
+                    pay_fees,
+                ))
+                .await?;
+            transaction.spent.merge(unshielded_pinned);
+            Ok::<_, ContractError>(transaction)
+        })
         .await?;
     transaction.spent.merge(pinned);
-    transaction.spent.merge(unshielded_pinned);
     Ok(transaction)
 }
 
@@ -548,7 +571,7 @@ async fn attach_and_prove(
     circuit_offers: CircuitOffers,
     prepared: Vec<PreparedInput>,
     (change_cpk, change_epk): (helpers::CoinPublicKey, helpers::EncryptionPublicKey),
-    unshielded_keys: &UnshieldedKeys,
+    unshielded_keys: &[TransactionSigningKey],
     pay_fees: bool,
 ) -> Result<TransferResult, ContractError> {
     let CircuitOffers {
@@ -611,13 +634,6 @@ async fn attach_and_prove(
     Ok(builds.balance_transaction(&unpaid.tx_bytes).await?)
 }
 
-/// The keys that sign the unshielded spends of a call's offers, in the order
-/// of each offer's inputs.
-struct UnshieldedKeys {
-    guaranteed: Vec<TransactionSigningKey>,
-    fallible: Vec<TransactionSigningKey>,
-}
-
 /// Sign the call's unshielded spends over the proven, sealed transaction.
 ///
 /// An unshielded signature covers the intent's `data_to_sign`, which holds the
@@ -627,9 +643,9 @@ struct UnshieldedKeys {
 /// later, which leaves this intent and its signatures as they are.
 fn sign_unshielded_spends(
     unpaid: TransferResult,
-    keys: &UnshieldedKeys,
+    keys: &[TransactionSigningKey],
 ) -> Result<TransferResult, ContractError> {
-    if keys.guaranteed.is_empty() && keys.fallible.is_empty() {
+    if keys.is_empty() {
         return Ok(unpaid);
     }
     let construction =
@@ -652,37 +668,36 @@ fn sign_unshielded_spends(
         .erase_signatures()
         .data_to_sign(INTENT_SEGMENT);
     let mut rng = <helpers::StdRng as rand::SeedableRng>::from_entropy();
+    // The builder sorts an offer's inputs, so each is signed with the key whose
+    // verifying key owns it, not by position.
     let sign = |offer: &Option<
         helpers::Sp<helpers::UnshieldedOffer<helpers::Signature, DefaultDB>, DefaultDB>,
     >,
-                keys: &[TransactionSigningKey],
                 rng: &mut helpers::StdRng|
      -> Result<_, ContractError> {
         let Some(offer) = offer else { return Ok(None) };
-        if offer.inputs.len() != keys.len() {
-            return Err(ContractError::Construction(format!(
-                "an unshielded offer spends {} inputs but the call holds {} keys for it",
-                offer.inputs.len(),
-                keys.len()
-            )));
-        }
-        let signatures: Vec<_> = keys
+        let signatures = offer
+            .inputs
             .iter()
-            .map(|key| key.sign(rng, &data_to_sign))
-            .collect();
+            .map(|input| {
+                keys.iter()
+                    .find(|key| key.verifying_key() == input.owner)
+                    .map(|key| key.sign(rng, &data_to_sign))
+                    .ok_or_else(|| {
+                        ContractError::Construction(
+                            "an unshielded input of the call has no key that owns it".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(helpers::Sp::new(helpers::UnshieldedOffer {
             inputs: offer.inputs.clone(),
             outputs: offer.outputs.clone(),
             signatures: signatures.into(),
         })))
     };
-    intent.guaranteed_unshielded_offer = sign(
-        &intent.guaranteed_unshielded_offer,
-        &keys.guaranteed,
-        &mut rng,
-    )?;
-    intent.fallible_unshielded_offer =
-        sign(&intent.fallible_unshielded_offer, &keys.fallible, &mut rng)?;
+    intent.guaranteed_unshielded_offer = sign(&intent.guaranteed_unshielded_offer, &mut rng)?;
+    intent.fallible_unshielded_offer = sign(&intent.fallible_unshielded_offer, &mut rng)?;
     stx.intents = stx.intents.insert(INTENT_SEGMENT, intent);
     let mut tx_bytes = Vec::new();
     tagged_serialize(&tx, &mut tx_bytes).map_err(|e| construction("write the signed call", &e))?;
@@ -1000,6 +1015,158 @@ mod tests {
             program: Default::default(),
             version: None,
         }
+    }
+
+    /// The effects a circuit leaves, by kind, as the standard library records
+    /// them: `receive` is `unshielded_inputs`, `send` is `unshielded_outputs`,
+    /// `mint` is `unshielded_mints` by domain separator, and `pay` a claimed
+    /// spend to a user.
+    struct Moves {
+        receive: u128,
+        send: u128,
+        mint: u64,
+        pay: u128,
+    }
+
+    fn the_contract() -> ContractAddress {
+        ContractAddress(HashOutput([3; 32]))
+    }
+
+    /// The token `the_contract` mints under domain separator `[4; 32]`.
+    fn minted_token() -> UnshieldedTokenType {
+        the_contract().custom_unshielded_token_type(HashOutput([4; 32]))
+    }
+
+    fn transcript_moving(token: UnshieldedTokenType, moves: Moves) -> Transcript<DefaultDB> {
+        use helpers::onchain_runtime::context::{ClaimedUnshieldedSpendsKey, Effects};
+        let mut effects = Effects::<DefaultDB>::default();
+        if moves.receive > 0 {
+            effects.unshielded_inputs = effects
+                .unshielded_inputs
+                .insert(TokenType::Unshielded(token), moves.receive);
+        }
+        if moves.send > 0 {
+            effects.unshielded_outputs = effects
+                .unshielded_outputs
+                .insert(TokenType::Unshielded(token), moves.send);
+        }
+        if moves.mint > 0 {
+            effects.unshielded_mints = effects
+                .unshielded_mints
+                .insert(HashOutput([4; 32]), moves.mint);
+        }
+        if moves.pay > 0 {
+            effects.claimed_unshielded_spends = effects.claimed_unshielded_spends.insert(
+                ClaimedUnshieldedSpendsKey::from_inner(
+                    TokenType::Unshielded(token),
+                    PublicAddress::User(a_user()),
+                ),
+                moves.pay,
+            );
+        }
+        Transcript {
+            gas: Default::default(),
+            effects,
+            program: Default::default(),
+            version: None,
+        }
+    }
+
+    fn owed(token: UnshieldedTokenType, moves: Moves) -> Vec<(UnshieldedTokenType, u128)> {
+        deposits_of(Some(&transcript_moving(token, moves)), the_contract())
+    }
+
+    #[test]
+    fn a_receive_is_owed_by_the_caller() {
+        assert_eq!(
+            owed(
+                a_token(),
+                Moves {
+                    receive: 50,
+                    send: 0,
+                    mint: 0,
+                    pay: 0
+                }
+            ),
+            vec![(a_token(), 50)]
+        );
+    }
+
+    #[test]
+    fn a_mint_or_a_send_to_the_contract_itself_costs_the_caller_nothing() {
+        // mintUnshieldedToken to kernel.self() records the mint and the receipt.
+        assert_eq!(
+            owed(
+                minted_token(),
+                Moves {
+                    receive: 70,
+                    send: 0,
+                    mint: 70,
+                    pay: 0
+                }
+            ),
+            vec![]
+        );
+        // sendUnshielded to kernel.self() records the output and the receipt.
+        assert_eq!(
+            owed(
+                a_token(),
+                Moves {
+                    receive: 30,
+                    send: 30,
+                    mint: 0,
+                    pay: 0
+                }
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_mint_paid_to_a_user_does_not_fund_a_receive() {
+        // The mint covers the user's payout, so the caller still funds the receive.
+        assert_eq!(
+            owed(
+                minted_token(),
+                Moves {
+                    receive: 20,
+                    send: 0,
+                    mint: 70,
+                    pay: 70
+                }
+            ),
+            vec![(minted_token(), 20)]
+        );
+    }
+
+    #[test]
+    fn a_payout_from_the_contracts_balance_is_not_the_callers() {
+        // sendUnshielded to a user: the output funds the payout.
+        assert_eq!(
+            owed(
+                a_token(),
+                Moves {
+                    receive: 0,
+                    send: 40,
+                    mint: 0,
+                    pay: 40
+                }
+            ),
+            vec![]
+        );
+        // A deposit beside that payout is still owed in full.
+        assert_eq!(
+            owed(
+                a_token(),
+                Moves {
+                    receive: 25,
+                    send: 40,
+                    mint: 0,
+                    pay: 40
+                }
+            ),
+            vec![(a_token(), 25)]
+        );
     }
 
     fn a_user() -> helpers::coin_structure::coin::UserAddress {
