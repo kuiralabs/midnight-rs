@@ -69,19 +69,35 @@ fn payouts_of(transcript: Option<&Transcript<DefaultDB>>) -> Vec<UtxoOutputInfo<
 /// What a transcript takes from its caller with `receiveUnshielded`, by
 /// token.
 ///
-/// The caller funds each with UTXOs in the transcript's own segment, since the
-/// ledger balances every (token, segment) on its own. Dust never moves this
-/// way.
-fn deposits_of(transcript: Option<&Transcript<DefaultDB>>) -> Vec<(UnshieldedTokenType, u128)> {
+/// A contract that mints a token to itself also records receiving it, and the
+/// mint, not the caller, supplies that value; so each token's mints to the
+/// contract come off what it receives. The caller funds the rest with UTXOs in
+/// the transcript's own segment, since the ledger balances every (token,
+/// segment) on its own. Dust never moves this way.
+fn deposits_of(
+    transcript: Option<&Transcript<DefaultDB>>,
+    contract: ContractAddress,
+) -> Vec<(UnshieldedTokenType, u128)> {
     let Some(transcript) = transcript else {
         return Vec::new();
     };
-    transcript
-        .effects
+    let effects = &transcript.effects;
+    let minted = |token_type: UnshieldedTokenType| -> u128 {
+        effects
+            .unshielded_mints
+            .iter()
+            .filter(|kv| contract.custom_unshielded_token_type(*kv.0) == token_type)
+            .map(|kv| u128::from(*kv.1))
+            .sum()
+    };
+    effects
         .unshielded_inputs
         .iter()
         .filter_map(|kv| match *kv.0 {
-            TokenType::Unshielded(token_type) => Some((token_type, *kv.1)),
+            TokenType::Unshielded(token_type) => {
+                let owed = kv.1.saturating_sub(minted(token_type));
+                (owed > 0).then_some((token_type, owed))
+            }
             _ => None,
         })
         .collect()
@@ -212,8 +228,8 @@ pub(crate) async fn call_transaction(
 
     let guaranteed_payouts = payouts_of(guaranteed.as_ref());
     let fallible_payouts = payouts_of(fallible.as_ref());
-    let guaranteed_deposits = deposits_of(guaranteed.as_ref());
-    let fallible_deposits = deposits_of(fallible.as_ref());
+    let guaranteed_deposits = deposits_of(guaranteed.as_ref(), helper_addr);
+    let fallible_deposits = deposits_of(fallible.as_ref(), helper_addr);
     if let Some((token_type, _)) = guaranteed_deposits
         .iter()
         .find(|(token, _)| fallible_deposits.iter().any(|(other, _)| other == token))
