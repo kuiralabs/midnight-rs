@@ -15,7 +15,10 @@ pub use builder::{
     BuildInputs, DustSpendBatch, PreparedTransfer, TransferBuilder, balance_external, chain_time,
     fee_speck, longest_ttl, prepare_no_validate,
 };
-pub use inputs::{PreparedInput, prepare_shielded_inputs};
+pub use inputs::{
+    PreparedInput, PreparedUnshielded, PreparedUtxoSpend, prepare_shielded_inputs,
+    prepare_unshielded_inputs,
+};
 
 /// The generation this module builds for.
 pub const LEDGER: crate::LedgerVersion = crate::LedgerVersion::V8;

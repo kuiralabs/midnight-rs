@@ -8,11 +8,12 @@ use midnight_types::{Nullifier, SpentInputs, TransferRequest, WalletError};
 use super::facade::{ReservedBuild, WalletBuilds};
 use super::helpers::{
     BuildContext, DefaultDB, FinalizedTransaction, ProofProvider, StandardTransactionInfo, StdRng,
+    UnshieldedTokenType,
 };
 use super::types::convert::IntoLedger;
 use super::types::{
-    PreparedInput, PreparedTransfer, TransferBuilder, balance_external, longest_ttl,
-    prepare_no_validate, prepare_shielded_inputs,
+    PreparedInput, PreparedTransfer, PreparedUnshielded, TransferBuilder, balance_external,
+    longest_ttl, prepare_no_validate, prepare_shielded_inputs, prepare_unshielded_inputs,
 };
 use crate::LocalWallet;
 
@@ -114,6 +115,45 @@ impl WalletBuilds for LocalWallet {
             prepared,
             SpentInputs::from_shielded(nullifiers, reserved_at),
         ))
+    }
+
+    async fn spend_unshielded(
+        &self,
+        context: &Arc<BuildContext>,
+        token_type: UnshieldedTokenType,
+        amount: u128,
+    ) -> Result<(PreparedUnshielded, SpentInputs), WalletError> {
+        let mut guard = self.inner().write().await;
+        let wallet = super::wallet_state_mut(&mut guard)?;
+        let prepared = prepare_unshielded_inputs(
+            context,
+            wallet.seed(),
+            token_type,
+            amount,
+            Default::default(),
+        )
+        .await?;
+        // The funding view in `context` predates this hold, so a UTXO selected
+        // from it can have been reserved since.
+        if let Some(taken) = prepared
+            .spent
+            .iter()
+            .find(|key| wallet.reserved_unshielded_keys().any(|held| held == *key))
+        {
+            return Err(WalletError::InputsReserved {
+                held: format!("unshielded UTXO {taken:?}"),
+            });
+        }
+        let reserved_at = context.latest_block_context().tblock;
+        wallet.reserve_pending(
+            Vec::new(),
+            prepared.spent.clone(),
+            Vec::new(),
+            reserved_at,
+            longest_ttl(context),
+        );
+        let spent = SpentInputs::from_unshielded(prepared.spent.clone(), reserved_at);
+        Ok((prepared, spent))
     }
 
     async fn prepare_fees(

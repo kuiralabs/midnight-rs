@@ -13,11 +13,11 @@ use helpers::coin_structure::coin::{
 };
 use helpers::coin_structure::transfer::Recipient;
 use helpers::{
-    AlignedValue, BuildContext, BuildContractAction, BuildUtxoOutput, BuilderContext,
-    ContractAddress, ContractCallPrototype, DefaultDB, EntryPointBuf, FromContext, IntentInfo,
-    KeyLocation, OfferInfo, OutputInfo, ProofPreimage, ShieldedWallet, SplittableRng,
-    StandardTransactionInfo, TokenInfo, Transcript, UnshieldedOfferInfo, UnshieldedWallet,
-    UtxoOutputInfo,
+    AlignedValue, BuildContext, BuildContractAction, BuildUtxoOutput, BuildUtxoSpend,
+    BuilderContext, ContractAddress, ContractCallPrototype, DefaultDB, EntryPointBuf, FromContext,
+    IntentInfo, KeyLocation, OfferInfo, OutputInfo, ProofPreimage, ShieldedWallet, SplittableRng,
+    StandardTransactionInfo, TokenInfo, Transcript, UnshieldedOfferInfo, UnshieldedTokenType,
+    UnshieldedWallet, UtxoOutputInfo,
 };
 use midnight_base_crypto::fab::{InvalidBuiltinDecode, ValueSlice};
 use midnight_base_crypto::time::Timestamp;
@@ -25,7 +25,7 @@ use midnight_provider::ProviderError;
 use midnight_typed_state::{ContractState, InMemoryDB};
 use midnight_types::TransferResult;
 
-use super::types::PreparedInput;
+use super::types::{PreparedInput, PreparedUnshielded};
 use crate::address::format_contract_address;
 use crate::call::ShieldedInputs;
 use crate::change::{change_due, total_by_key};
@@ -61,6 +61,27 @@ fn payouts_of(transcript: Option<&Transcript<DefaultDB>>) -> Vec<UtxoOutputInfo<
                 owner: UnshieldedWallet::from(owner),
                 token_type,
             })
+        })
+        .collect()
+}
+
+/// What a transcript takes from its caller with `receiveUnshielded`, by
+/// token.
+///
+/// The caller funds each with UTXOs in the transcript's own segment, since the
+/// ledger balances every (token, segment) on its own. Dust never moves this
+/// way.
+fn deposits_of(transcript: Option<&Transcript<DefaultDB>>) -> Vec<(UnshieldedTokenType, u128)> {
+    let Some(transcript) = transcript else {
+        return Vec::new();
+    };
+    transcript
+        .effects
+        .unshielded_inputs
+        .iter()
+        .filter_map(|kv| match *kv.0 {
+            TokenType::Unshielded(token_type) => Some((token_type, *kv.1)),
+            _ => None,
         })
         .collect()
 }
@@ -190,6 +211,17 @@ pub(crate) async fn call_transaction(
 
     let guaranteed_payouts = payouts_of(guaranteed.as_ref());
     let fallible_payouts = payouts_of(fallible.as_ref());
+    let guaranteed_deposits = deposits_of(guaranteed.as_ref());
+    let fallible_deposits = deposits_of(fallible.as_ref());
+    if let Some((token_type, _)) = guaranteed_deposits
+        .iter()
+        .find(|(token, _)| fallible_deposits.iter().any(|(other, _)| other == token))
+    {
+        return Err(ContractError::Construction(format!(
+            "a call that receives unshielded token {token_type:?} in both its guaranteed and \
+             fallible parts is not yet supported"
+        )));
+    }
 
     // 3. Make the circuit's proving keys resolvable, and prove with the
     //    resolver that finds them.
@@ -268,30 +300,52 @@ pub(crate) async fn call_transaction(
         private_transcript_outputs,
     };
 
-    // Outputs only: the contract's own balance funds the payout, so this
-    // transaction has nothing to spend.
-    let offer = |payouts: Vec<UtxoOutputInfo<UnshieldedWallet>>| {
-        (!payouts.is_empty()).then(|| UnshieldedOfferInfo {
-            inputs: Vec::new(),
-            outputs: payouts
-                .into_iter()
-                .map(|p| Box::new(p) as Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>)
-                .collect(),
-        })
-    };
-
-    let intent_info: IntentInfo<DefaultDB, BuildContext> = IntentInfo {
-        guaranteed_unshielded_offer: offer(guaranteed_payouts),
-        fallible_unshielded_offer: offer(fallible_payouts),
-        actions: vec![Box::new(call_action)],
-    };
-
     // 6. Build funded transaction with Dust fees and real ZK proofs.
     //
     // Stages 1 to 5 run against a context that carries no wallet, so the
     // circuit, its proving keys and the contract's own state never depend on
     // who pays. The payer joins here.
     builds.add_funding(&context).await?;
+
+    // The value the circuit takes from its caller comes from the payer's
+    // UTXOs, reserved under one guard until the call reaches the chain. Each
+    // segment's draws ride that segment's offer, with their change.
+    let draws: Vec<_> = guaranteed_deposits
+        .iter()
+        .chain(&fallible_deposits)
+        .copied()
+        .collect();
+    let (mut guaranteed_drawn, unshielded_held) =
+        builds.prepare_unshielded_inputs(&context, &draws).await?;
+    let fallible_drawn = guaranteed_drawn.split_off(guaranteed_deposits.len());
+
+    // The contract's own balance funds a payout, so a payout adds an output and
+    // spends nothing. A deposit adds the payer's spends and their change.
+    let offer = |payouts: Vec<UtxoOutputInfo<UnshieldedWallet>>, drawn: Vec<PreparedUnshielded>| {
+        let mut inputs: Vec<Box<dyn BuildUtxoSpend<DefaultDB, BuildContext>>> = Vec::new();
+        let mut outputs: Vec<Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>> = payouts
+            .into_iter()
+            .map(|p| Box::new(p) as Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>)
+            .collect();
+        for draw in drawn {
+            inputs.extend(
+                draw.inputs
+                    .into_iter()
+                    .map(|i| Box::new(i) as Box<dyn BuildUtxoSpend<DefaultDB, BuildContext>>),
+            );
+            outputs.extend(
+                draw.change
+                    .map(|c| Box::new(c) as Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>),
+            );
+        }
+        (!inputs.is_empty() || !outputs.is_empty()).then(|| UnshieldedOfferInfo { inputs, outputs })
+    };
+
+    let intent_info: IntentInfo<DefaultDB, BuildContext> = IntentInfo {
+        guaranteed_unshielded_offer: offer(guaranteed_payouts, guaranteed_drawn),
+        fallible_unshielded_offer: offer(fallible_payouts, fallible_drawn),
+        actions: vec![Box::new(call_action)],
+    };
     let build_context = context.clone();
     let mut tx_info =
         StandardTransactionInfo::new_from_context(context, builds.proof_provider(), None);
@@ -397,17 +451,19 @@ pub(crate) async fn call_transaction(
         minted_value,
     };
     let pinned = held.spent().clone();
-    let mut transaction = held
-        .keep_on_ok(attach_and_prove(
+    let unshielded_pinned = unshielded_held.spent().clone();
+    let mut transaction = unshielded_held
+        .keep_on_ok(held.keep_on_ok(attach_and_prove(
             builds,
             tx_info,
             circuit_offers,
             prepared,
             (change_cpk, change_epk),
             pay_fees,
-        ))
+        )))
         .await?;
     transaction.spent.merge(pinned);
+    transaction.spent.merge(unshielded_pinned);
     Ok(transaction)
 }
 

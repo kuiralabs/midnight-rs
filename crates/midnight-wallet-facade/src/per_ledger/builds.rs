@@ -7,8 +7,9 @@ use midnight_types::{Nullifier, SpentInputs, TransferRequest, WalletError};
 
 use super::helpers::{
     BuildContext, DefaultDB, FinalizedTransaction, ProofProvider, StandardTransactionInfo, StdRng,
+    UnshieldedTokenType,
 };
-use super::types::{PreparedInput, PreparedTransfer};
+use super::types::{PreparedInput, PreparedTransfer, PreparedUnshielded};
 use crate::WalletFacade;
 
 /// A prepared build whose inputs the wallet already holds.
@@ -106,6 +107,21 @@ pub trait WalletBuilds: WalletFacade {
         rng: &mut StdRng,
     ) -> Result<(Vec<PreparedInput>, SpentInputs), WalletError>;
 
+    /// Select this wallet's UTXOs of `token_type` covering `amount`, and
+    /// reserve them, as one transition: the unshielded value a contract call
+    /// takes from its caller with `receiveUnshielded`.
+    ///
+    /// Call this after the funding view is in `context`, for the reason
+    /// [`Self::spend_shielded`] gives. The spends carry the one key that signs
+    /// them, not the seed. The reservation stands until the caller releases
+    /// it, and a build that never reaches the chain must hand the UTXOs back.
+    async fn spend_unshielded(
+        &self,
+        context: &Arc<BuildContext>,
+        token_type: UnshieldedTokenType,
+        amount: u128,
+    ) -> Result<(PreparedUnshielded, SpentInputs), WalletError>;
+
     /// Pay the fee of a transaction someone else finished, and reserve what
     /// that draws, as one transition.
     ///
@@ -156,6 +172,15 @@ impl<T: WalletBuilds + ?Sized> WalletBuilds for Arc<T> {
         rng: &mut StdRng,
     ) -> Result<(Vec<PreparedInput>, SpentInputs), WalletError> {
         (**self).spend_shielded(context, nullifiers, rng).await
+    }
+
+    async fn spend_unshielded(
+        &self,
+        context: &Arc<BuildContext>,
+        token_type: UnshieldedTokenType,
+        amount: u128,
+    ) -> Result<(PreparedUnshielded, SpentInputs), WalletError> {
+        (**self).spend_unshielded(context, token_type, amount).await
     }
 
     async fn prepare_fees(

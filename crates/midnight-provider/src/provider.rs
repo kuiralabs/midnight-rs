@@ -1368,6 +1368,11 @@ impl HeldInputs {
         Self { wallet, spent }
     }
 
+    /// Hold `spent` too, so one guard releases every reservation of a build.
+    pub(crate) fn absorb(&mut self, spent: SpentInputs) {
+        self.spent.merge(spent);
+    }
+
     /// The inputs this guard holds. A build reads them before
     /// [`Self::keep_on_ok`] when its result has to name them beside the
     /// inputs of a later reservation (see

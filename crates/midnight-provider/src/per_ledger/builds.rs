@@ -9,9 +9,9 @@ use super::facade::{ReservedBuild, WalletBuilds};
 use super::helpers::midnight_serialize::{tagged_deserialize, tagged_serialize};
 use super::helpers::{
     BuildContext, DefaultDB, FinalizedTransaction, FromContext, ProofProvider,
-    StandardTransactionInfo, StdRng, TokenType,
+    StandardTransactionInfo, StdRng, TokenType, UnshieldedTokenType,
 };
-use super::types::{PreparedInput, fee_speck};
+use super::types::{PreparedInput, PreparedUnshielded, fee_speck};
 use crate::{HeldInputs, MidnightProvider, ProviderError};
 
 /// The attached wallet's builds on this generation.
@@ -140,6 +140,42 @@ impl<'a> Builds<'a> {
         midnight_types::refuse_repeated_nullifiers(&nullifiers)?;
         let (prepared, spent) = self.wallet.spend_shielded(context, nullifiers, rng).await?;
         Ok((prepared, HeldInputs::of(spent, self.provider.facade())))
+    }
+
+    /// Draw each `(token_type, amount)` of `draws` from the attached wallet's
+    /// UTXOs, reserved until the build reaches the chain: the value a
+    /// contract call takes from its caller with `receiveUnshielded`. The
+    /// result holds one [`PreparedUnshielded`] per draw, in order, and one
+    /// guard over all of them.
+    ///
+    /// `context` must be the one the caller is building against, with the
+    /// funding view already in it. Run the rest of the build through the
+    /// guard's `keep_on_ok`, so a build that fails hands the UTXOs back. Each
+    /// draw selects from that one view, so two draws of one token would pick
+    /// the same UTXO; a caller combines them first.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError::Wallet`] with
+    /// [`WalletError::InsufficientUnshielded`](midnight_types::WalletError::InsufficientUnshielded)
+    /// when the wallet holds less than a draw's amount. The draws reserved
+    /// before it are handed back.
+    pub async fn prepare_unshielded_inputs(
+        &self,
+        context: &Arc<BuildContext>,
+        draws: &[(UnshieldedTokenType, u128)],
+    ) -> Result<(Vec<PreparedUnshielded>, HeldInputs), ProviderError> {
+        let mut held = HeldInputs::of(SpentInputs::default(), self.provider.facade());
+        let mut prepared = Vec::with_capacity(draws.len());
+        for &(token_type, amount) in draws {
+            let (draw, spent) = self
+                .wallet
+                .spend_unshielded(context, token_type, amount)
+                .await?;
+            held.absorb(spent);
+            prepared.push(draw);
+        }
+        Ok((prepared, held))
     }
 
     /// Pay the fees for an external party's proven, fee-less transaction from

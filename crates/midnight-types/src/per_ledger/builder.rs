@@ -269,7 +269,10 @@ fn shielded_selection_error(context: &BuildContext, e: ShieldedCoinSelectionErro
 
 /// Type an unshielded UTXO selection that fell short, with what the seed holds
 /// of the token in the funding view the selection read.
-async fn utxo_selection_error(context: &BuildContext, e: UtxoSelectionError) -> WalletError {
+pub(crate) async fn utxo_selection_error(
+    context: &BuildContext,
+    e: UtxoSelectionError,
+) -> WalletError {
     match e {
         UtxoSelectionError::InsufficientBalance {
             required,

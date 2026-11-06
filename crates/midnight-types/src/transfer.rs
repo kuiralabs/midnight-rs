@@ -109,6 +109,17 @@ impl SpentInputs {
         }
     }
 
+    /// The unshielded UTXOs a build pinned, for one that spends nothing else.
+    pub fn from_unshielded(unshielded: Vec<SpentUtxoKey>, reserved_at: Timestamp) -> Self {
+        Self {
+            unshielded: unshielded
+                .into_iter()
+                .map(|input| ReservedInput { input, reserved_at })
+                .collect(),
+            ..Self::default()
+        }
+    }
+
     /// Add the inputs of `other`. Each input keeps its own stamp.
     pub fn merge(&mut self, other: SpentInputs) {
         self.dust.extend(other.dust);

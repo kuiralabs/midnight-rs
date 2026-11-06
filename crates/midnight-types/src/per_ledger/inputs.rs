@@ -128,6 +128,95 @@ pub fn prepare_shielded_inputs(
     })
 }
 
+/// An unshielded UTXO the wallet selected for a builder to spend.
+///
+/// Unlike a shielded spend, an unshielded one cannot be finished up front: its
+/// signature covers the whole intent, which the builder assembles later. So the
+/// builder gets the spend and the one key that signs it, not the seed that
+/// derives every key of the wallet.
+pub struct PreparedUtxoSpend {
+    spend: helpers::UtxoSpend,
+    key: helpers::TransactionSigningKey,
+}
+
+#[async_trait::async_trait]
+impl helpers::BuildUtxoSpend<DefaultDB, BuildContext> for PreparedUtxoSpend {
+    async fn build(&self, _context: Arc<BuildContext>) -> helpers::UtxoSpend {
+        self.spend.clone()
+    }
+
+    fn signing_key(&self, _context: Arc<BuildContext>) -> helpers::TransactionSigningKey {
+        self.key.clone()
+    }
+}
+
+/// The unshielded value a wallet put toward a build: the spends, the change
+/// back to the wallet, and the UTXOs to reserve.
+pub struct PreparedUnshielded {
+    /// One spend per selected UTXO.
+    pub inputs: Vec<PreparedUtxoSpend>,
+    /// What the inputs carry beyond `amount`, paid back to the wallet's own
+    /// address, or `None` when they carry exactly `amount`.
+    pub change: Option<helpers::UtxoOutputInfo<helpers::UnshieldedWallet>>,
+    /// The UTXOs the inputs spend, which the wallet reserves.
+    pub spent: Vec<crate::SpentUtxoKey>,
+}
+
+/// Select UTXOs of `token_type` that `seed` owns, covering `amount`, from the
+/// funding view in `context`.
+///
+/// # Errors
+///
+/// [`WalletError::InsufficientUnshielded`] when the view holds less than
+/// `amount` of the token.
+pub async fn prepare_unshielded_inputs(
+    context: &Arc<BuildContext>,
+    seed: &Seed,
+    token_type: helpers::UnshieldedTokenType,
+    amount: u128,
+    strategy: helpers::CoinSelectionStrategy,
+) -> Result<PreparedUnshielded, WalletError> {
+    let owner = seed.into_ledger();
+    let (selected, change) = match helpers::UtxoSpendInfo::utxos_to_cover_value(
+        context.clone(),
+        owner.clone(),
+        amount,
+        token_type,
+        strategy,
+    )
+    .await
+    {
+        Ok(selected) => selected,
+        Err(e) => return Err(super::builder::utxo_selection_error(context, e).await),
+    };
+    let wallet = helpers::UnshieldedWallet::default(owner);
+    let key = wallet.transaction_signing_key();
+    let mut inputs = Vec::with_capacity(selected.len());
+    let mut spent = Vec::with_capacity(selected.len());
+    for info in &selected {
+        let spend =
+            helpers::BuildUtxoSpend::<DefaultDB, BuildContext>::build(info, context.clone()).await;
+        spent.push(crate::SpentUtxoKey {
+            intent_hash: spend.intent_hash.0,
+            output_index: spend.output_no,
+        });
+        inputs.push(PreparedUtxoSpend {
+            spend,
+            key: key.clone(),
+        });
+    }
+    let change = (change > 0).then(|| helpers::UtxoOutputInfo {
+        value: change,
+        owner: helpers::UnshieldedWallet::from(wallet.user_address),
+        token_type,
+    });
+    Ok(PreparedUnshielded {
+        inputs,
+        change,
+        spent,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -163,6 +163,16 @@ macro_rules! stub_builds {
                 unimplemented!("this wallet holds no coins")
             }
 
+            async fn spend_unshielded(
+                &self,
+                _context: &Arc<midnight_helpers::$ledger::BuildContext>,
+                _token_type: midnight_helpers::$ledger::UnshieldedTokenType,
+                _amount: u128,
+            ) -> Result<(midnight_types::$ledger::PreparedUnshielded, SpentInputs), WalletError>
+            {
+                unimplemented!("this wallet holds no coins")
+            }
+
             async fn prepare_fees(
                 &self,
                 _tx_info: midnight_helpers::$ledger::StandardTransactionInfo<
