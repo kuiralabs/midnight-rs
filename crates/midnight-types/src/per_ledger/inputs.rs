@@ -139,6 +139,14 @@ pub struct PreparedUtxoSpend {
     key: helpers::TransactionSigningKey,
 }
 
+impl PreparedUtxoSpend {
+    /// The key that signs this spend. A builder needs it again to sign the
+    /// spend over the proven, sealed transaction.
+    pub fn signing_key(&self) -> &helpers::TransactionSigningKey {
+        &self.key
+    }
+}
+
 #[async_trait::async_trait]
 impl helpers::BuildUtxoSpend<DefaultDB, BuildContext> for PreparedUtxoSpend {
     async fn build(&self, _context: Arc<BuildContext>) -> helpers::UtxoSpend {

@@ -12,12 +12,13 @@ use helpers::coin_structure::coin::{
     Info as ZswapCoinInfo, PublicAddress, PublicKey, QualifiedInfo, ShieldedTokenType, TokenType,
 };
 use helpers::coin_structure::transfer::Recipient;
+use helpers::midnight_serialize::{tagged_deserialize, tagged_serialize};
 use helpers::{
     AlignedValue, BuildContext, BuildContractAction, BuildUtxoOutput, BuildUtxoSpend,
     BuilderContext, ContractAddress, ContractCallPrototype, DefaultDB, EntryPointBuf, FromContext,
     IntentInfo, KeyLocation, OfferInfo, OutputInfo, ProofPreimage, ShieldedWallet, SplittableRng,
-    StandardTransactionInfo, TokenInfo, Transcript, UnshieldedOfferInfo, UnshieldedTokenType,
-    UnshieldedWallet, UtxoOutputInfo,
+    StandardTransactionInfo, TokenInfo, TransactionSigningKey, Transcript, UnshieldedOfferInfo,
+    UnshieldedTokenType, UnshieldedWallet, UtxoOutputInfo,
 };
 use midnight_base_crypto::fab::{InvalidBuiltinDecode, ValueSlice};
 use midnight_base_crypto::time::Timestamp;
@@ -341,6 +342,17 @@ pub(crate) async fn call_transaction(
         (!inputs.is_empty() || !outputs.is_empty()).then(|| UnshieldedOfferInfo { inputs, outputs })
     };
 
+    let keys_of = |drawn: &[PreparedUnshielded]| -> Vec<TransactionSigningKey> {
+        drawn
+            .iter()
+            .flat_map(|d| d.inputs.iter().map(|i| i.signing_key().clone()))
+            .collect()
+    };
+    let unshielded_keys = UnshieldedKeys {
+        guaranteed: keys_of(&guaranteed_drawn),
+        fallible: keys_of(&fallible_drawn),
+    };
+
     let intent_info: IntentInfo<DefaultDB, BuildContext> = IntentInfo {
         guaranteed_unshielded_offer: offer(guaranteed_payouts, guaranteed_drawn),
         fallible_unshielded_offer: offer(fallible_payouts, fallible_drawn),
@@ -459,6 +471,7 @@ pub(crate) async fn call_transaction(
             circuit_offers,
             prepared,
             (change_cpk, change_epk),
+            &unshielded_keys,
             pay_fees,
         )))
         .await?;
@@ -519,6 +532,7 @@ async fn attach_and_prove(
     circuit_offers: CircuitOffers,
     prepared: Vec<PreparedInput>,
     (change_cpk, change_epk): (helpers::CoinPublicKey, helpers::EncryptionPublicKey),
+    unshielded_keys: &UnshieldedKeys,
     pay_fees: bool,
 ) -> Result<TransferResult, ContractError> {
     let CircuitOffers {
@@ -570,7 +584,7 @@ async fn attach_and_prove(
     // its own intent segment, which leaves the circuit proof untouched. A
     // transaction with no user circuit can take
     // `super::deploy::build_with_mock_fee_proofs` instead.
-    let unpaid = prove_without_fee(tx_info).await?;
+    let unpaid = sign_unshielded_spends(prove_without_fee(tx_info).await?, unshielded_keys)?;
     if !pay_fees {
         return Ok(unpaid);
     }
@@ -579,6 +593,84 @@ async fn attach_and_prove(
     // else's: the fee intent rides its own segment, so nothing here re-proves
     // the circuit.
     Ok(builds.balance_transaction(&unpaid.tx_bytes).await?)
+}
+
+/// The keys that sign the unshielded spends of a call's offers, in the order
+/// of each offer's inputs.
+struct UnshieldedKeys {
+    guaranteed: Vec<TransactionSigningKey>,
+    fallible: Vec<TransactionSigningKey>,
+}
+
+/// Sign the call's unshielded spends over the proven, sealed transaction.
+///
+/// An unshielded signature covers the intent's `data_to_sign`, which holds the
+/// intent's binding commitment. The builder signed at assembly, and sealing
+/// after proving replaces that commitment, so those signatures no longer
+/// verify (node error 175). The fee rides an intent of its own merged in
+/// later, which leaves this intent and its signatures as they are.
+fn sign_unshielded_spends(
+    unpaid: TransferResult,
+    keys: &UnshieldedKeys,
+) -> Result<TransferResult, ContractError> {
+    if keys.guaranteed.is_empty() && keys.fallible.is_empty() {
+        return Ok(unpaid);
+    }
+    let construction =
+        |what: &str, e: &dyn std::fmt::Display| ContractError::Construction(format!("{what}: {e}"));
+    let mut tx: helpers::FinalizedTransaction<DefaultDB> =
+        tagged_deserialize(&mut &unpaid.tx_bytes[..])
+            .map_err(|e| construction("read the proven call", &e))?;
+    let helpers::Transaction::Standard(stx) = &mut tx else {
+        return Err(ContractError::Construction(
+            "the proven call is not a standard transaction".into(),
+        ));
+    };
+    let intent = stx
+        .intents
+        .get(&INTENT_SEGMENT)
+        .ok_or_else(|| ContractError::Construction("the proven call has no intent".into()))?;
+    let mut intent = (*intent).clone();
+    let data_to_sign = intent
+        .erase_proofs()
+        .erase_signatures()
+        .data_to_sign(INTENT_SEGMENT);
+    let mut rng = <helpers::StdRng as rand::SeedableRng>::from_entropy();
+    let sign = |offer: &Option<
+        helpers::Sp<helpers::UnshieldedOffer<helpers::Signature, DefaultDB>, DefaultDB>,
+    >,
+                keys: &[TransactionSigningKey],
+                rng: &mut helpers::StdRng|
+     -> Result<_, ContractError> {
+        let Some(offer) = offer else { return Ok(None) };
+        if offer.inputs.len() != keys.len() {
+            return Err(ContractError::Construction(format!(
+                "an unshielded offer spends {} inputs but the call holds {} keys for it",
+                offer.inputs.len(),
+                keys.len()
+            )));
+        }
+        let signatures: Vec<_> = keys
+            .iter()
+            .map(|key| key.sign(rng, &data_to_sign))
+            .collect();
+        Ok(Some(helpers::Sp::new(helpers::UnshieldedOffer {
+            inputs: offer.inputs.clone(),
+            outputs: offer.outputs.clone(),
+            signatures: signatures.into(),
+        })))
+    };
+    intent.guaranteed_unshielded_offer = sign(
+        &intent.guaranteed_unshielded_offer,
+        &keys.guaranteed,
+        &mut rng,
+    )?;
+    intent.fallible_unshielded_offer =
+        sign(&intent.fallible_unshielded_offer, &keys.fallible, &mut rng)?;
+    stx.intents = stx.intents.insert(INTENT_SEGMENT, intent);
+    let mut tx_bytes = Vec::new();
+    tagged_serialize(&tx, &mut tx_bytes).map_err(|e| construction("write the signed call", &e))?;
+    Ok(TransferResult { tx_bytes, ..unpaid })
 }
 
 /// Build and prove `tx_info` with no fee, and serialize and price the result.
