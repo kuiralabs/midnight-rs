@@ -26,8 +26,8 @@ CARGO ?= cargo
 #    crates/compact/bindgen-macro/tests/ui/fixtures/unknown-type.sexp.
 # 5. Replace the old commit in README.md, docs/compact-natives.md and
 #    crates/midnight-contract/tests/fixtures/README.md.
-COMPACT_REV    := c7a8d2a21593d98d003a54bf5937375ba9aa8d66
-COMPACTC_IMAGE := ghcr.io/romarq/compactc:$(COMPACT_REV)
+COMPACT_REV    := 4c4aeabf79be5646239797d3aaf726315e708f47
+COMPACTC_IMAGE ?= kuira/compactc:0.36.0-fork-4c4aeab
 # The cache of public parameters that key generation reads and fills, in the
 # fall-back order of the SDK prover, so the two share one cache. Set
 # MIDNIGHT_PP to use another cache. Each target creates it before the run,
