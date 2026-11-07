@@ -310,9 +310,11 @@ fork-upgrade:
 		runtime-upgrade --wasm-file /runtime.wasm -c //Dave -c //Eve -t //Alice -t //Bob \
 		--rpc-url ws://node:9944 --signer-key //Alice
 
-# The crossing test forks the chain itself, so it runs once per `fork-up`.
+# The crossing test forks the chain itself, so it runs once per `fork-up`. Crossing
+# the fork runs deep enough to overflow a test thread's 2 MiB default stack; 8 MiB is
+# the stack the SDKs give their runtime threads.
 fork-test:
-	$(E2E_ENV) MIDNIGHT_FORK_UPGRADE_CMD="$(MAKE) -C $(CURDIR) --no-print-directory fork-upgrade" \
+	$(E2E_ENV) RUST_MIN_STACK=8388608 MIDNIGHT_FORK_UPGRADE_CMD="$(MAKE) -C $(CURDIR) --no-print-directory fork-upgrade" \
 		$(CARGO) test -p midnight-contract --test fork_crossing -- --show-output
 
 fork-down:
