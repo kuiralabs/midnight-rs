@@ -43,7 +43,7 @@ pub fn op_to_json(op: &midnight_onchain_runtime::ops::Op<ResultModeVerify, InMem
         Op::Addi { immediate } => json!({ "addi": { "immediate": immediate } }),
         Op::Subi { immediate } => json!({ "subi": { "immediate": immediate } }),
         Op::Push { storage, value } => json!({
-            "push": { "storage": storage, "value": state_value_to_json(value) },
+            "push": { "storage": storage, "value": state_value_to_json(&value.clone().into()) },
         }),
         Op::Branch { skip } => json!({ "branch": { "skip": skip } }),
         Op::Jmp { skip } => json!({ "jmp": { "skip": skip } }),
@@ -66,7 +66,7 @@ pub fn op_to_json(op: &midnight_onchain_runtime::ops::Op<ResultModeVerify, InMem
                     .iter()
                     .map(|key| match &*key {
                         Key::Value(av) => {
-                            json!({ "tag": "value", "value": aligned_value_to_json(av) })
+                            json!({ "tag": "value", "value": aligned_value_to_json(&av.clone().into()) })
                         }
                         Key::Stack => json!({ "tag": "stack" }),
                     })
