@@ -696,25 +696,23 @@ impl<'a> TransferBuilder<'a> {
 
     /// Build a dust address registration transaction.
     ///
-    /// Spends and re-creates one tNIGHT UTXO while registering the dust
-    /// address. Uses "generationless fee availability" (virtual dust accrued
-    /// by holding tNIGHT) to self-fund the registration fee, so a wallet needs
-    /// no dust to register.
+    /// Registers every tNIGHT UTXO that generates no dust yet, in one
+    /// transaction. Uses "generationless fee availability" (virtual dust
+    /// accrued by holding tNIGHT) to self-fund the registration fee, so a
+    /// wallet needs no dust to register.
     ///
-    /// One UTXO per call, because a second unshielded input in the same
-    /// transaction costs more verification than its bytes buy in dismissal
-    /// allowance, and the ledger refuses it with
-    /// `FeeCalculation(OutsideTimeToDismiss)`, custom error 168.
+    /// The UTXO carrying the most generationless dust, which is value against
+    /// age, goes alone in the guaranteed offer and backs the fee. A second
+    /// guaranteed input costs more verification than its bytes buy in
+    /// dismissal allowance, and the ledger refuses the transaction with
+    /// `FeeCalculation(OutsideTimeToDismiss)`, custom error 168 on ledger 8
+    /// and 231 on ledger 9. The other unregistered UTXOs go in the fallible
+    /// offer, spent into one output, which generates dust because it is
+    /// created after the registration. This is how the TypeScript wallet
+    /// builds it.
     ///
-    /// A registration covers the UTXO it spends, and it registers the address,
-    /// so tNIGHT arriving afterwards generates dust with no further call. It
-    /// does not reach back: tNIGHT the wallet already held stays outside dust
-    /// generation until a registration spends it. Call this until it reports
-    /// that every tNIGHT UTXO generates dust, which is
-    /// [`crate::DustBalance::unregistered_night_utxos`] calls.
-    ///
-    /// The UTXO chosen is the one carrying the most generationless dust, which
-    /// is value against age, so the fee has the most room.
+    /// The registration also covers the address, so tNIGHT arriving afterwards
+    /// generates dust with no further call.
     ///
     /// Skips tNIGHT UTXOs that already generate dust, and errors when every
     /// one of them does. The ledger grants no generationless availability for
@@ -788,6 +786,15 @@ impl<'a> TransferBuilder<'a> {
             )
         })?;
         let night_utxos = [chosen];
+        // Every other tNIGHT UTXO that generates nothing yet rides in the
+        // fallible offer, spent into one output: an output created after the
+        // registration generates dust, so one registration covers them all.
+        // They declare no allowance, so a guessed creation time costs nothing.
+        let rest: Vec<&TrackedUtxo> = all_night
+            .iter()
+            .copied()
+            .filter(|u| !u.is_registered_for_dust() && u.spent_key() != chosen.spent_key())
+            .collect();
 
         let inputs: Vec<Box<dyn BuildUtxoSpend<DefaultDB, BuildContext>>> = night_utxos
             .iter()
@@ -820,9 +827,33 @@ impl<'a> TransferBuilder<'a> {
         // intent's guaranteed inputs only, and creates the initial dust
         // outputs from that same offer, so a UTXO in the fallible leg is
         // declared but never counted and the node rejects the registration.
+        let fallible_unshielded_offer = (!rest.is_empty()).then(|| {
+            let inputs: Vec<Box<dyn BuildUtxoSpend<DefaultDB, BuildContext>>> = rest
+                .iter()
+                .map(|utxo| {
+                    let info = UtxoSpendInfo {
+                        value: utxo.value,
+                        owner: seed.clone(),
+                        token_type: NIGHT,
+                        intent_hash: Some(helpers::IntentHash(utxo.intent_hash)),
+                        output_number: Some(utxo.output_index),
+                    };
+                    Box::new(info) as Box<dyn BuildUtxoSpend<DefaultDB, BuildContext>>
+                })
+                .collect();
+            let output = UtxoOutputInfo {
+                value: rest.iter().map(|u| u.value).sum(),
+                owner: seed.clone(),
+                token_type: NIGHT,
+            };
+            let outputs: Vec<Box<dyn BuildUtxoOutput<DefaultDB, BuildContext>>> =
+                vec![Box::new(output)];
+            UnshieldedOfferInfo { inputs, outputs }
+        });
+
         let intent = IntentInfo {
             guaranteed_unshielded_offer: Some(UnshieldedOfferInfo { inputs, outputs }),
-            fallible_unshielded_offer: None,
+            fallible_unshielded_offer,
             actions: vec![],
         };
 
@@ -848,8 +879,11 @@ impl<'a> TransferBuilder<'a> {
         });
         tx_info.use_mock_proofs_for_fees(true);
 
-        let spent_unshielded_inputs: Vec<SpentUtxoKey> =
-            night_utxos.iter().map(|u| u.spent_key()).collect();
+        let spent_unshielded_inputs: Vec<SpentUtxoKey> = night_utxos
+            .iter()
+            .chain(rest.iter())
+            .map(|u| u.spent_key())
+            .collect();
 
         let mut prepared = prepare_with_ttl(tx_info, self.ttl).await?;
         prepared.set_spent_unshielded_inputs(spent_unshielded_inputs);

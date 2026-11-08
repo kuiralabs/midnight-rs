@@ -2,10 +2,7 @@
 //! wallet meets before it registers.
 //!
 //! A registration can build cleanly and still be refused, so this test
-//! submits and waits for the verdict. That is the only way the size and
-//! dismissal-cost rule shows up: a registration spending two unshielded
-//! inputs builds cleanly and is refused with
-//! `FeeCalculation(OutsideTimeToDismiss)`, custom error 168.
+//! submits and waits for the verdict.
 //!
 //! Needs a devnet, and a genesis wallet with tNIGHT and dust to fund the
 //! fresh address this drives.
@@ -29,14 +26,13 @@ fn unused_seed() -> String {
 }
 
 /// A fresh wallet with three unregistered tNIGHT UTXOs and no Dust gets a
-/// typed shortfall for each build it cannot fund, and then registers one UTXO.
+/// typed shortfall for each build it cannot fund, and then one registration
+/// covers all three UTXOs.
 ///
-/// A wallet with several unregistered UTXOs is the case that fails when a
-/// registration spends every one of them: it builds, and the node refuses it.
 /// The shortfall steps stay in this fn, because a second fn would fund from the
 /// same funder seed and race it.
 #[tokio::test]
-async fn a_fresh_wallet_reports_its_shortfalls_and_registers_one_of_three_utxos() {
+async fn a_fresh_wallet_reports_its_shortfalls_and_one_registration_covers_its_three_utxos() {
     let Some((node_url, indexer_url)) = common::devnet_urls() else {
         return;
     };
@@ -154,7 +150,7 @@ async fn a_fresh_wallet_reports_its_shortfalls_and_registers_one_of_three_utxos(
         .expect("build and submit the registration")
         .wait_finalized()
         .await
-        .expect("the node must accept a registration that spends one tNIGHT input");
+        .expect("the node must accept a registration that spends all three tNIGHT inputs");
 
     // Finalized on chain is not yet visible through the indexer, and the
     // wallet only learns UTXO state by replaying what the indexer serves. Poll
@@ -180,7 +176,7 @@ async fn a_fresh_wallet_reports_its_shortfalls_and_registers_one_of_three_utxos(
         "the registration must name the Dust key the wallet tracks"
     );
     assert_eq!(
-        after.unregistered_night_utxos, 2,
-        "a registration covers the UTXO it spends, not the ones already held"
+        after.unregistered_night_utxos, 0,
+        "one registration covers every tNIGHT UTXO the wallet held"
     );
 }
