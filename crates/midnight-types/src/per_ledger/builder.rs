@@ -668,9 +668,22 @@ impl<'a> TransferBuilder<'a> {
             outputs,
         };
 
+        // tNIGHT goes in the fallible offer, as the TypeScript wallet sends it.
+        // Each tNIGHT input costs a dust generation tree update, and the ledger
+        // counts the guaranteed offer's cost toward the time to dismiss, so a
+        // guaranteed offer refuses a second tNIGHT input with
+        // `FeeCalculation(OutsideTimeToDismiss)`, custom error 168 on ledger 8
+        // and 231 on ledger 9. The fallible offer's cost is not counted there.
+        // If the fallible segment fails, the fee is still paid and the verdict
+        // is a partial success, which the wait reports as not applied.
+        let (guaranteed_unshielded_offer, fallible_unshielded_offer) = if token_type == NIGHT {
+            (None, Some(unshielded_offer))
+        } else {
+            (Some(unshielded_offer), None)
+        };
         let intent_info: IntentInfo<DefaultDB, BuildContext> = IntentInfo {
-            guaranteed_unshielded_offer: Some(unshielded_offer),
-            fallible_unshielded_offer: None,
+            guaranteed_unshielded_offer,
+            fallible_unshielded_offer,
             actions: vec![],
         };
 
