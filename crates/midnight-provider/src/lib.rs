@@ -14,6 +14,7 @@ mod provider;
 pub mod proving_data;
 mod remote_prover;
 mod submit;
+pub mod swap_offer;
 pub mod transfer;
 mod types;
 
@@ -22,6 +23,7 @@ pub use proof_providers::ProofProviders;
 pub use provider::{Builds, HeldInputs, MidnightProvider, NodeHeader};
 pub use remote_prover::RemoteProofServer;
 pub use submit::{NotApplied, PendingTx, PreparedTx, SubmitError, TxInBlock, Verdict};
+pub use swap_offer::{NotASwapOffer, SwapLeg, SwapOfferContents, read_swap_offer};
 pub use transfer::{
     DustRegistration, DustlessBuilder, DustlessTransaction, ShieldedSwap, ShieldedTransfer,
     UnshieldedTransfer,
