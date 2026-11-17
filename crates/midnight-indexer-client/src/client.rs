@@ -112,6 +112,20 @@ impl IndexerClient {
         let data: BlockQueryData = self.execute(queries::BLOCK_QUERY, vars).await?;
         Ok(data.block)
     }
+
+    // -- Transactions --
+
+    /// Fetch the transaction with `offset`'s hash or identifier. `None` when
+    /// the indexer does not list it, which includes a transaction whose block
+    /// is not final yet.
+    pub async fn transaction(
+        &self,
+        offset: TransactionOffset,
+    ) -> Result<Option<IndexedTransaction>, IndexerError> {
+        let vars = TransactionQueryVars { offset };
+        let data: TransactionQueryData = self.execute(queries::TRANSACTION_QUERY, vars).await?;
+        Ok(data.transactions.into_iter().next())
+    }
 }
 
 #[cfg(test)]

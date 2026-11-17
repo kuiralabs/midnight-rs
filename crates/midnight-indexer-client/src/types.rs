@@ -80,6 +80,65 @@ impl BlockOffset {
 }
 
 // ---------------------------------------------------------------------------
+// Transaction
+// ---------------------------------------------------------------------------
+
+/// Offset for transaction queries: the transaction's hash (32 bytes, 64 hex
+/// characters) or one of its identifiers (66 hex characters).
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum TransactionOffset {
+    Hash { hash: String },
+    Identifier { identifier: String },
+}
+
+/// A transaction the indexer lists, which it does only once its block is final.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedTransaction {
+    /// `RegularTransaction` or `SystemTransaction`.
+    #[serde(rename = "__typename")]
+    pub kind: String,
+    pub hash: String,
+    pub block: TransactionBlock,
+    /// Regular transactions only.
+    #[serde(default)]
+    pub identifiers: Option<Vec<String>>,
+    /// The fee paid in specks, as a decimal string. Regular transactions only;
+    /// a failed one pays it too.
+    #[serde(default)]
+    pub fee: Option<String>,
+    /// Regular transactions only.
+    #[serde(default)]
+    pub transaction_result: Option<TransactionResult>,
+}
+
+/// The block a listed transaction is in. `timestamp` is in milliseconds.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TransactionBlock {
+    pub height: i64,
+    pub hash: String,
+    pub timestamp: i64,
+}
+
+/// How the ledger applied a regular transaction.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TransactionResult {
+    /// `SUCCESS`, `PARTIAL_SUCCESS` or `FAILURE`.
+    pub status: String,
+    /// Each segment's success; segment 0 is the guaranteed section.
+    #[serde(default)]
+    pub segments: Option<Vec<SegmentResult>>,
+}
+
+/// One segment's success within a transaction.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SegmentResult {
+    pub id: i64,
+    pub success: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Query variable structs (used internally by IndexerClient)
 // ---------------------------------------------------------------------------
 
@@ -89,6 +148,11 @@ pub(crate) struct BlockQueryVars {
     pub offset: Option<BlockOffset>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct TransactionQueryVars {
+    pub offset: TransactionOffset,
+}
+
 // ---------------------------------------------------------------------------
 // Query-specific response wrappers
 // ---------------------------------------------------------------------------
@@ -96,6 +160,11 @@ pub(crate) struct BlockQueryVars {
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct BlockQueryData {
     pub block: Option<Block>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct TransactionQueryData {
+    pub transactions: Vec<IndexedTransaction>,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,5 +212,84 @@ mod tests {
             errors: Some(vec![]),
         };
         assert!(matches!(no_errors.into_result(), Ok(Some(1))));
+    }
+
+    /// The indexer's reply for a localnet send (ledger 9), as it sent it.
+    #[test]
+    fn deserialize_a_listed_transaction() {
+        let body = r#"{"transactions":[{"__typename":"RegularTransaction","hash":"22094f4eb6c32e567eb116e98b3ead6393aeb25ca57d9cfbc4b89cf9dcf3ef98","identifiers":["008e540745728d99457c08206981e32e5755dc34505fbcbf4c84c406e4962b1d64"],"fee":"499169974095779","transactionResult":{"status":"SUCCESS","segments":null},"block":{"height":144071,"hash":"feb56007171b0c095627835e70aa38f2de4982e86e881f36da2cb30f7204aad0","timestamp":1794886518002}}]}"#;
+        let data: TransactionQueryData = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            data.transactions,
+            vec![IndexedTransaction {
+                kind: "RegularTransaction".into(),
+                hash: "22094f4eb6c32e567eb116e98b3ead6393aeb25ca57d9cfbc4b89cf9dcf3ef98".into(),
+                block: TransactionBlock {
+                    height: 144_071,
+                    hash: "feb56007171b0c095627835e70aa38f2de4982e86e881f36da2cb30f7204aad0".into(),
+                    timestamp: 1_794_886_518_002,
+                },
+                identifiers: Some(vec![
+                    "008e540745728d99457c08206981e32e5755dc34505fbcbf4c84c406e4962b1d64".into()
+                ]),
+                fee: Some("499169974095779".into()),
+                transaction_result: Some(TransactionResult {
+                    status: "SUCCESS".into(),
+                    segments: None
+                }),
+            }]
+        );
+        let none: TransactionQueryData = serde_json::from_str(r#"{"transactions":[]}"#).unwrap();
+        assert!(none.transactions.is_empty());
+    }
+
+    /// A system transaction carries none of the regular fields, and a partial success lists its segments.
+    #[test]
+    fn deserialize_a_system_transaction_and_a_partial_success() {
+        let system: IndexedTransaction = serde_json::from_str(
+            r#"{"__typename":"SystemTransaction","hash":"ab","block":{"height":1,"hash":"cd","timestamp":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (system.identifiers, system.fee, system.transaction_result),
+            (None, None, None)
+        );
+        let partial: TransactionResult =
+            serde_json::from_str(r#"{"status":"PARTIAL_SUCCESS","segments":[{"id":0,"success":true},{"id":1,"success":false}]}"#)
+                .unwrap();
+        assert_eq!(
+            partial.segments,
+            Some(vec![
+                SegmentResult {
+                    id: 0,
+                    success: true
+                },
+                SegmentResult {
+                    id: 1,
+                    success: false
+                }
+            ])
+        );
+    }
+
+    /// The offset is the schema's `TransactionOffset` input: one of `hash` or `identifier`.
+    #[test]
+    fn a_transaction_offset_names_one_field() {
+        let vars = TransactionQueryVars {
+            offset: TransactionOffset::Hash { hash: "ab".into() },
+        };
+        assert_eq!(
+            serde_json::to_value(vars).unwrap(),
+            serde_json::json!({"offset": {"hash": "ab"}})
+        );
+        let vars = TransactionQueryVars {
+            offset: TransactionOffset::Identifier {
+                identifier: "cd".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(vars).unwrap(),
+            serde_json::json!({"offset": {"identifier": "cd"}})
+        );
     }
 }
