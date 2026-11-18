@@ -594,6 +594,47 @@ impl MidnightProvider {
         ShieldedSwap::new(self, give_token, give_amount, receive_token, receive_amount)
     }
 
+    /// Take a shielded swap offer: build this wallet's mirrored half, merge it
+    /// with the offer, and fund the swap's Dust fee, returning the swap ready
+    /// to submit with [`Self::submit_reserved`].
+    ///
+    /// The half pays what the offer wants from this wallet's shielded coins
+    /// and pays this wallet what the offer gives. The result's `spent` holds
+    /// both the half's coins and the fee's Dust, so a rejected submit hands
+    /// all of them back; a failure before the result exists hands them back
+    /// here. Whether the terms are the agreed ones, and whether the offer is
+    /// still live, are the caller's checks, made first.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError::NotASwapOffer`] for bytes that are not a swap offer,
+    /// and the errors of [`Self::shielded_swap`], [`Self::merge_transactions`]
+    /// and [`Self::balance_transaction`], such as a wallet that holds less
+    /// than the offer wants.
+    pub async fn take_swap_offer(&self, offer: &[u8]) -> Result<TransferResult, ProviderError> {
+        let contents = crate::read_swap_offer(offer)?;
+        let half = self
+            .shielded_swap(
+                contents.want.token,
+                contents.want.amount,
+                contents.give.token,
+                contents.give.amount,
+            )
+            .build()
+            .await?;
+        let held = HeldInputs::of(half.spent.clone(), self.facade());
+        let half_spent = half.spent;
+        let half_bytes = half.tx_bytes;
+        let mut swap = held
+            .keep_on_ok(async {
+                let merged = self.merge_transactions(&[offer.to_vec(), half_bytes])?;
+                self.balance_transaction(&merged).await
+            })
+            .await?;
+        swap.spent.merge(half_spent);
+        Ok(swap)
+    }
+
     /// Build an unshielded (UTXO) transfer transaction. See
     /// [`Self::transfer_shielded`] for reservation semantics and the
     /// `.await` vs `.build()` distinction.

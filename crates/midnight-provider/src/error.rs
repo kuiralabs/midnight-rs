@@ -48,6 +48,10 @@ pub enum ProviderError {
     /// `MidnightProvider::merge_transactions`). Nothing was sent to the node.
     #[error("transaction: {0}")]
     Transaction(String),
+
+    /// Bytes given as a swap offer are not one. Nothing was built or sent.
+    #[error(transparent)]
+    NotASwapOffer(#[from] crate::NotASwapOffer),
 }
 
 impl From<NotApplied> for ProviderError {
