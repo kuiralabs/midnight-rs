@@ -143,6 +143,20 @@ pub enum WalletError {
         available: u128,
     },
 
+    /// A swap offer spends one coin worth exactly what it gives, and the
+    /// wallet holds no such coin that a pending build has not reserved.
+    ///
+    /// Split one first: a shielded transfer of `amount` to this wallet's own
+    /// address leaves a coin worth exactly that once it finalizes and the
+    /// wallet syncs it.
+    #[error("no shielded coin of {token_type} worth exactly {amount}")]
+    NoShieldedCoinWorth {
+        /// The token the offer gives.
+        token_type: ShieldedTokenType,
+        /// The amount the offer gives.
+        amount: u128,
+    },
+
     /// The wallet holds too little of an unshielded token for the transfer.
     ///
     /// When a pending build spends UTXOs of this token, wait for its

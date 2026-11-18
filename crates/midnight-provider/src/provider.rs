@@ -594,6 +594,40 @@ impl MidnightProvider {
         ShieldedSwap::new(self, give_token, give_amount, receive_token, receive_amount)
     }
 
+    /// Make a shielded swap offer: this wallet's half of a swap that gives
+    /// `give_amount` of `give_token` and is paid `want_amount` of `want_token`
+    /// to this wallet, fee-less, for a taker to complete and fund.
+    ///
+    /// The offer spends one coin worth exactly `give_amount`, so it makes no
+    /// change. The build reserves that coin until the chain time `held_until`,
+    /// the maker's expiry, so later builds in this wallet do not spend it and
+    /// cancel the offer unawares; it is not submitted, and nothing releases
+    /// it. The result's `tx_bytes` are the offer for the taker.
+    ///
+    /// # Errors
+    ///
+    /// [`WalletError::NoShieldedCoinWorth`](midnight_types::WalletError::NoShieldedCoinWorth)
+    /// when the wallet holds enough of `give_token` but in no coin worth
+    /// exactly `give_amount` (split one first with a transfer to this
+    /// wallet), and the errors of [`Self::shielded_swap`].
+    pub async fn make_swap_offer(
+        &self,
+        give_token: ShieldedTokenType,
+        give_amount: u128,
+        want_token: ShieldedTokenType,
+        want_amount: u128,
+        held_until: crate::Timestamp,
+    ) -> Result<TransferResult, ProviderError> {
+        let request = TransferRequest::new(midnight_types::TransferKind::ShieldedSwapOffer {
+            give_token,
+            give_amount,
+            receive_token: want_token,
+            receive_amount: want_amount,
+            held_until,
+        });
+        self.build_then_prove(request).await
+    }
+
     /// Take a shielded swap offer: build this wallet's mirrored half, merge it
     /// with the offer, and fund the swap's Dust fee, returning the swap ready
     /// to submit with [`Self::submit_reserved`].

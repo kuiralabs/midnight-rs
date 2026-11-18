@@ -431,6 +431,23 @@ impl<'a> TransferBuilder<'a> {
                     )
                     .await
             }
+            TransferKind::ShieldedSwapOffer {
+                give_token,
+                give_amount,
+                receive_token,
+                receive_amount,
+                held_until,
+            } => {
+                builder
+                    .prepare_shielded_swap_offer(
+                        give_token.into_ledger(),
+                        give_amount,
+                        receive_token.into_ledger(),
+                        receive_amount,
+                        held_until,
+                    )
+                    .await
+            }
             TransferKind::DustRegistration { utxo_ctime, target } => {
                 builder.prepare_register_dust(utxo_ctime, target).await
             }
@@ -542,6 +559,92 @@ impl<'a> TransferBuilder<'a> {
             self.coin_selection,
         )
         .map_err(|e| shielded_selection_error(&self.context, e))?;
+        self.offer_from_coins(spend_token, inputs, change, payment, pay_fees)
+            .await
+    }
+
+    /// Build the maker's half of a two-party shielded swap: a swap offer that
+    /// spends exactly one coin worth `give_amount` of `give_token` and pays
+    /// `receive_amount` of `receive_token` to this wallet.
+    ///
+    /// It is the half [`Self::prepare_shielded_swap`] builds, with two
+    /// differences an offer needs. It spends one coin worth exactly what it
+    /// gives, so it makes no change and holds no more than it gives until a
+    /// taker finds it. And its coin stays reserved until `held_until` rather
+    /// than for the chain's `global_ttl`, which a half with no intent gets.
+    ///
+    /// # Errors
+    ///
+    /// [`WalletError::InsufficientShielded`] when the wallet's spendable coins
+    /// of `give_token` add up to less than `give_amount`, and
+    /// [`WalletError::NoShieldedCoinWorth`] when they add up to enough but
+    /// none is worth exactly `give_amount`.
+    pub async fn prepare_shielded_swap_offer(
+        self,
+        give_token: ShieldedTokenType,
+        give_amount: u128,
+        receive_token: ShieldedTokenType,
+        receive_amount: u128,
+        held_until: Timestamp,
+    ) -> Result<PreparedTransfer, WalletError> {
+        let seed = self.state.seed().into_ledger();
+        let (coin, held) = self.context.with_wallet_from_seed(seed.clone(), |wallet| {
+            let mut held = 0u128;
+            let mut coin = None;
+            for (nullifier, info) in wallet.shielded.state.coins.iter() {
+                if info.type_ != give_token {
+                    continue;
+                }
+                held = held.saturating_add(info.value);
+                if coin.is_none() && info.value == give_amount {
+                    coin = Some(InputInfo {
+                        origin: seed.clone(),
+                        token_type: give_token,
+                        value: info.value,
+                        nullifier: Some(nullifier),
+                    });
+                }
+            }
+            (coin, held)
+        });
+        let Some(coin) = coin else {
+            return Err(if held < give_amount {
+                WalletError::InsufficientShielded {
+                    token_type: give_token.into_sdk(),
+                    required: give_amount,
+                    available: held,
+                }
+            } else {
+                WalletError::NoShieldedCoinWorth {
+                    token_type: give_token.into_sdk(),
+                    amount: give_amount,
+                }
+            });
+        };
+        let payment = OutputInfo {
+            destination: self.state.seed().into_ledger(),
+            token_type: receive_token,
+            value: receive_amount,
+        };
+        let mut prepared = self
+            .offer_from_coins(give_token, vec![coin], 0, Box::new(payment), false)
+            .await?;
+        prepared.expires_at = held_until;
+        Ok(prepared)
+    }
+
+    /// Spend `inputs`, and put `payment` first in the offer, followed by
+    /// `change` (if any) back to this wallet.
+    async fn offer_from_coins(
+        self,
+        spend_token: ShieldedTokenType,
+        inputs: Vec<InputInfo<helpers::WalletSeed>>,
+        change: u128,
+        payment: Box<dyn helpers::BuildOutput<DefaultDB, BuildContext>>,
+        pay_fees: bool,
+    ) -> Result<PreparedTransfer, WalletError> {
+        let seed = self.state.seed();
+        let from_seed = seed.into_ledger();
 
         // Every input from `coins_to_cover_value` carries a pinned nullifier;
         // error rather than drop one silently, since a missing nullifier would

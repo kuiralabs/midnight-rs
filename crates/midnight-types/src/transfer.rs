@@ -168,6 +168,16 @@ pub enum TransferKind {
         receive_token: ShieldedTokenType,
         receive_amount: u128,
     },
+    /// The maker's half of a two-party shielded swap, a swap offer, always
+    /// fee-less. See `TransferBuilder::prepare_shielded_swap_offer`.
+    ShieldedSwapOffer {
+        give_token: ShieldedTokenType,
+        give_amount: u128,
+        receive_token: ShieldedTokenType,
+        receive_amount: u128,
+        /// The chain time until which the build reserves the offer's coin.
+        held_until: Timestamp,
+    },
     /// A dust-address registration. See
     /// `TransferBuilder::prepare_register_dust`.
     DustRegistration {
