@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use midnight_types::{Nullifier, SpentInputs, TransferRequest, WalletError};
+use midnight_types::{Nullifier, SpentInputs, TransferKind, TransferRequest, WalletError};
 
 use super::facade::{ReservedBuild, WalletBuilds};
 use super::helpers::{
@@ -59,7 +59,14 @@ impl WalletBuilds for LocalWallet {
     ) -> Result<ReservedBuild, WalletError> {
         let mut guard = self.inner().write().await;
         let wallet = super::wallet_state_mut(&mut guard)?;
-        let context = wallet.build_context_inner()?;
+        // A cancel spends the coins its offer's build reserved.
+        let context = match &request.kind {
+            TransferKind::ShieldedOfferCancel { nullifiers } => {
+                let reclaim: Vec<_> = nullifiers.iter().map(|n| n.into_ledger()).collect();
+                wallet.build_context_reclaiming(&reclaim)?
+            }
+            _ => wallet.build_context_inner()?,
+        };
         let prepared = TransferBuilder::new(&*wallet, context, proof_provider)
             .prepare(request)
             .await?;

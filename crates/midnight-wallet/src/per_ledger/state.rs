@@ -984,6 +984,18 @@ impl Wallet {
     /// passed cannot produce a valid transaction, and would block the
     /// underlying UTXOs forever otherwise.
     pub fn add_funding(&mut self, ctx: &LedgerContext<DefaultDB>) -> Result<(), WalletError> {
+        self.add_funding_reclaiming(ctx, &[])
+    }
+
+    /// [`Self::add_funding`], with the shielded coins whose nullifiers are in
+    /// `reclaim` kept in the funding view although a pending build reserved
+    /// them: the coins of this wallet's own swap offer, which its cancel
+    /// spends.
+    pub(crate) fn add_funding_reclaiming(
+        &mut self,
+        ctx: &LedgerContext<DefaultDB>,
+        reclaim: &[helpers::Nullifier],
+    ) -> Result<(), WalletError> {
         // One funding view per context. Funding twice would merge a fresh UTXO
         // set into the one already there: the second pass skips what a pending
         // build reserved, but cannot withdraw what the first pass inserted, so
@@ -1064,6 +1076,9 @@ impl Wallet {
             // nullifier (the spend confirmed and resync dropped the coin) is a
             // harmless no-op.
             for nullifier in self.reserved_shielded_nullifiers() {
+                if reclaim.contains(nullifier) {
+                    continue;
+                }
                 shielded.state.coins = shielded.state.coins.remove(nullifier);
             }
 
@@ -1131,6 +1146,16 @@ impl Wallet {
     pub fn build_context_inner(&mut self) -> Result<Arc<LedgerContext<DefaultDB>>, WalletError> {
         let ctx = self.execution_context()?;
         self.add_funding(&ctx)?;
+        Ok(ctx)
+    }
+
+    /// [`Self::build_context_inner`], funded with [`Self::add_funding_reclaiming`].
+    pub(crate) fn build_context_reclaiming(
+        &mut self,
+        reclaim: &[helpers::Nullifier],
+    ) -> Result<Arc<LedgerContext<DefaultDB>>, WalletError> {
+        let ctx = self.execution_context()?;
+        self.add_funding_reclaiming(&ctx, reclaim)?;
         Ok(ctx)
     }
 
@@ -1967,6 +1992,43 @@ mod tests {
             ctx_wallet.shielded.state.coins.iter().count(),
             0,
             "reserved coin must be removed from the build context's Zswap state"
+        );
+    }
+
+    /// A cancel's build context holds the coins its offer reserved, and only
+    /// those: another build's reserved coin stays out of it.
+    #[test]
+    fn a_reclaiming_context_holds_the_reclaimed_coins_and_no_other_reserved_one() {
+        let mut wallet = test_wallet(None);
+        let offered = insert_shielded_coin(&mut wallet, 7, 100);
+        let other = insert_shielded_coin(&mut wallet, 8, 50);
+        wallet.reserve_pending(
+            Vec::new(),
+            Vec::new(),
+            vec![offered, other],
+            Timestamp::from_secs(100),
+            Timestamp::MAX,
+        );
+
+        let ctx = wallet
+            .build_context_reclaiming(&[offered])
+            .expect("build context");
+
+        let wallets = ctx.wallets.lock().expect("wallets lock");
+        let ctx_wallet = wallets
+            .get(&wallet.seed().into_ledger())
+            .expect("funding wallet in context");
+        let held: Vec<Nullifier> = ctx_wallet
+            .shielded
+            .state
+            .coins
+            .iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(held, vec![offered], "only the offer's coin is reclaimed");
+        assert!(
+            wallet.spendable_shielded_coins().is_empty(),
+            "reclaiming for a build leaves both reservations in place"
         );
     }
 

@@ -448,6 +448,9 @@ impl<'a> TransferBuilder<'a> {
                     )
                     .await
             }
+            TransferKind::ShieldedOfferCancel { nullifiers } => {
+                builder.prepare_shielded_offer_cancel(&nullifiers).await
+            }
             TransferKind::DustRegistration { utxo_ctime, target } => {
                 builder.prepare_register_dust(utxo_ctime, target).await
             }
@@ -631,6 +634,67 @@ impl<'a> TransferBuilder<'a> {
             .await?;
         prepared.expires_at = held_until;
         Ok(prepared)
+    }
+
+    /// Build the cancel of this wallet's swap offer: a shielded transfer of
+    /// the coins with `nullifiers` (the offer's) back to this wallet, which
+    /// pays its fee in Dust. Once it lands, the offer's coins are spent, so no
+    /// taker can complete the offer.
+    ///
+    /// The build context must hold the offer's coins although the offer's
+    /// build reserved them, which the wallet's build for this kind sees to.
+    ///
+    /// # Errors
+    ///
+    /// [`WalletError::ShieldedCoinNotHeld`] when the wallet no longer holds one
+    /// of the coins, and [`WalletError::Transfer`] when the coins are of more
+    /// than one token or `nullifiers` is empty.
+    pub async fn prepare_shielded_offer_cancel(
+        self,
+        nullifiers: &[crate::Nullifier],
+    ) -> Result<PreparedTransfer, WalletError> {
+        let seed = self.state.seed().into_ledger();
+        let coins = self.context.with_wallet_from_seed(seed.clone(), |wallet| {
+            nullifiers
+                .iter()
+                .map(|wanted| {
+                    let nullifier = wanted.into_ledger();
+                    wallet
+                        .shielded
+                        .state
+                        .coins
+                        .get(&nullifier)
+                        .map(|info| InputInfo {
+                            origin: seed.clone(),
+                            token_type: info.type_,
+                            value: info.value,
+                            nullifier: Some(nullifier),
+                        })
+                        .ok_or(WalletError::ShieldedCoinNotHeld { nullifier: *wanted })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        let Some(token) = coins.first().map(|coin| coin.token_type) else {
+            return Err(WalletError::Transfer(
+                "an offer cancel names no coins".into(),
+            ));
+        };
+        if coins.iter().any(|coin| coin.token_type != token) {
+            return Err(WalletError::Transfer(
+                "an offer cancel spends coins of one token".into(),
+            ));
+        }
+        let total = coins
+            .iter()
+            .try_fold(0u128, |sum, coin| sum.checked_add(coin.value))
+            .ok_or_else(|| WalletError::Transfer("the offer's coins overflow u128".into()))?;
+        let payment = OutputInfo {
+            destination: seed,
+            token_type: token,
+            value: total,
+        };
+        self.offer_from_coins(token, coins, 0, Box::new(payment), true)
+            .await
     }
 
     /// Spend `inputs`, and put `payment` first in the offer, followed by

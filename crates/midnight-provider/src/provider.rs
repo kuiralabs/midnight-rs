@@ -628,6 +628,27 @@ impl MidnightProvider {
         self.build_then_prove(request).await
     }
 
+    /// Cancel this wallet's shielded swap offer: build a shielded transfer of
+    /// the offer's coins, the ones with `nullifiers`, back to this wallet,
+    /// paying its fee in Dust, ready to submit with [`Self::submit_reserved`].
+    ///
+    /// The offer's build reserved its coins, so no other build spends them;
+    /// this one does. Once the cancel lands, no taker can complete the offer.
+    /// Whether the offer is still live is the caller's check, made first.
+    ///
+    /// # Errors
+    ///
+    /// [`WalletError::ShieldedCoinNotHeld`](midnight_types::WalletError::ShieldedCoinNotHeld)
+    /// when the wallet no longer holds one of the coins (a taker spent it).
+    pub async fn cancel_swap_offer(
+        &self,
+        nullifiers: Vec<crate::Nullifier>,
+    ) -> Result<TransferResult, ProviderError> {
+        let request =
+            TransferRequest::new(midnight_types::TransferKind::ShieldedOfferCancel { nullifiers });
+        self.build_then_prove(request).await
+    }
+
     /// Take a shielded swap offer: build this wallet's mirrored half, merge it
     /// with the offer, and fund the swap's Dust fee, returning the swap ready
     /// to submit with [`Self::submit_reserved`].

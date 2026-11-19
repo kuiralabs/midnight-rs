@@ -98,7 +98,8 @@ pub use midnight_wallet_facade::WalletFacade;
 // layout and credential), and the client that looks a transaction up there.
 pub use midnight_indexer_client::{
     IndexedTransaction, IndexerClient, IndexerCredential, IndexerEndpoint, IndexerError,
-    SegmentResult, TransactionBlock, TransactionOffset, TransactionResult,
+    SegmentResult, ShieldedNullifierSpend, SubscriptionClient, TransactionBlock, TransactionOffset,
+    TransactionResult,
 };
 
 pub use background::BackgroundSync;

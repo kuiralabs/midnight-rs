@@ -178,6 +178,13 @@ pub enum TransferKind {
         /// The chain time until which the build reserves the offer's coin.
         held_until: Timestamp,
     },
+    /// The cancel of this wallet's swap offer: a shielded transfer of the
+    /// offer's coins back to this wallet, which pays its fee in Dust. See
+    /// `TransferBuilder::prepare_shielded_offer_cancel`.
+    ShieldedOfferCancel {
+        /// The nullifiers of the offer's coins.
+        nullifiers: Vec<Nullifier>,
+    },
     /// A dust-address registration. See
     /// `TransferBuilder::prepare_register_dust`.
     DustRegistration {

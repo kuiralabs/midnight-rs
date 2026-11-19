@@ -293,3 +293,20 @@ mod tests {
         );
     }
 }
+
+/// A shielded coin's spend, as the indexer lists it: the coin's nullifier, and
+/// the hash and block height of the transaction that spent it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShieldedNullifierSpend {
+    pub nullifier: String,
+    pub transaction_hash: String,
+    pub block_height: u64,
+}
+
+/// One event of the shielded nullifier subscription.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ShieldedNullifierSpendEvent {
+    pub shielded_nullifier_transactions: ShieldedNullifierSpend,
+}

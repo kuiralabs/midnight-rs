@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::Hash;
 
-use crate::{LedgerVersion, Network, ShieldedTokenType, UnknownLedger, UnshieldedTokenType};
+use crate::{
+    LedgerVersion, Network, Nullifier, ShieldedTokenType, UnknownLedger, UnshieldedTokenType,
+};
 
 /// Errors that can occur with wallet operations.
 #[derive(Debug, thiserror::Error)]
@@ -155,6 +157,14 @@ pub enum WalletError {
         token_type: ShieldedTokenType,
         /// The amount the offer gives.
         amount: u128,
+    },
+
+    /// A cancel spends an offer's coins back to this wallet, and the wallet
+    /// no longer holds one of them: a taker spent it, or another build did.
+    #[error("the wallet no longer holds the shielded coin with nullifier {}", hex::encode(nullifier.0.0))]
+    ShieldedCoinNotHeld {
+        /// The nullifier of the coin the wallet no longer holds.
+        nullifier: Nullifier,
     },
 
     /// The wallet holds too little of an unshielded token for the transfer.

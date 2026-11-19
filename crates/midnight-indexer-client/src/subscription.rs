@@ -497,3 +497,48 @@ pub mod queries {
         }
     "#;
 }
+
+/// The most nullifier prefixes the indexer takes in one shielded nullifier
+/// subscription.
+pub const MAX_NULLIFIER_PREFIXES: usize = 10;
+
+impl SubscriptionClient {
+    /// The spends of the shielded coins with `nullifiers` (hex) up to block
+    /// `to_block`, at or below the indexer's latest block; empty while none of
+    /// them is spent.
+    ///
+    /// The indexer matches by prefix, so only a spend of one of these exact
+    /// nullifiers counts. `nullifiers` goes in subscriptions of
+    /// [`MAX_NULLIFIER_PREFIXES`] each, every one of which ends once the
+    /// indexer has sent what it lists.
+    pub async fn shielded_nullifier_spends(
+        &self,
+        nullifiers: &[String],
+        to_block: u64,
+    ) -> Result<Vec<crate::types::ShieldedNullifierSpend>, IndexerError> {
+        let mut spends = Vec::new();
+        for chunk in nullifiers.chunks(MAX_NULLIFIER_PREFIXES) {
+            let variables = serde_json::json!({
+                "prefixes": chunk,
+                "fromBlock": 0,
+                "toBlock": to_block,
+            });
+            let mut events = self
+                .subscribe::<crate::types::ShieldedNullifierSpendEvent>(
+                    crate::queries::SHIELDED_NULLIFIER_SPENDS_SUBSCRIPTION,
+                    variables,
+                )
+                .await?;
+            while let Some(event) = events.next().await {
+                let spend = event?.shielded_nullifier_transactions;
+                if chunk
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&spend.nullifier))
+                {
+                    spends.push(spend);
+                }
+            }
+        }
+        Ok(spends)
+    }
+}

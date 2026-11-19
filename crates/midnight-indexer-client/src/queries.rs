@@ -28,3 +28,17 @@ pub const TRANSACTION_QUERY: &str = r#"
         }
     }
 "#;
+
+/// The transactions that spend shielded coins whose nullifiers start with one
+/// of `$prefixes` (ten at most), from `$fromBlock` to `$toBlock`. With
+/// `$toBlock` at or below the indexer's latest block, the stream completes
+/// once it has sent them all.
+pub const SHIELDED_NULLIFIER_SPENDS_SUBSCRIPTION: &str = r#"
+    subscription ShieldedNullifierSpends($prefixes: [HexEncoded!]!, $fromBlock: Int, $toBlock: Int) {
+        shieldedNullifierTransactions(nullifierPrefixes: $prefixes, fromBlock: $fromBlock, toBlock: $toBlock) {
+            nullifier
+            transactionHash
+            blockHeight
+        }
+    }
+"#;
