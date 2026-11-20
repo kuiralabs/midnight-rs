@@ -2,6 +2,7 @@
 
 use crate::error::InterpreterError;
 use crate::value::Value;
+use midnight_typed_state::{ContractState, InMemoryDB};
 
 /// Mutable context handed to each witness call during circuit execution.
 ///
@@ -14,12 +15,34 @@ use crate::value::Value;
 /// for the duration of the call.
 pub struct WitnessContext<'a> {
     private_state: &'a mut Vec<u8>,
+    ledger: Option<&'a ContractState<InMemoryDB>>,
 }
 
 impl<'a> WitnessContext<'a> {
-    /// Wrap a mutable private-state buffer.
+    /// Wrap a mutable private-state buffer, with no ledger state.
     pub fn new(private_state: &'a mut Vec<u8>) -> Self {
-        Self { private_state }
+        Self {
+            private_state,
+            ledger: None,
+        }
+    }
+
+    /// Wrap a mutable private-state buffer and the contract's ledger state as the circuit sees it
+    /// at the witness call, as the TypeScript runtime's `WitnessContext.ledger` does.
+    pub fn with_ledger(
+        private_state: &'a mut Vec<u8>,
+        ledger: &'a ContractState<InMemoryDB>,
+    ) -> Self {
+        Self {
+            private_state,
+            ledger: Some(ledger),
+        }
+    }
+
+    /// The contract's ledger state as the circuit sees it at this call: its state before the call
+    /// with the circuit's writes so far applied. `None` when the caller supplied none.
+    pub fn ledger(&self) -> Option<&ContractState<InMemoryDB>> {
+        self.ledger
     }
 
     /// The contract's current private state as opaque bytes (empty if unset).

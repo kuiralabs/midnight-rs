@@ -1347,7 +1347,7 @@ fn eval_witness_call(
         // Scope the WitnessContext's borrow of `ctx` so we can record the
         // result into `ctx.private_transcript_outputs` afterward.
         let outcome = {
-            let mut wctx = WitnessContext::new(&mut *ctx.private_state);
+            let mut wctx = WitnessContext::with_ledger(&mut *ctx.private_state, &ctx.state);
             w.call_witness(&mut wctx, name, &values)
         };
         if let WitnessOutcome::Value(v) = outcome? {
@@ -4008,6 +4008,57 @@ mod tests {
         )
         .expect("the witness runs");
         assert!(equal_at(&uint("255"), &result.result, &Value::Integer(9)));
+    }
+
+    /// A witness reads the contract's ledger as the circuit sees it, as the
+    /// TypeScript runtime's `WitnessContext.ledger` lets it.
+    #[test]
+    fn a_witness_reads_the_ledger_the_circuit_runs_on() {
+        struct LedgerReader;
+        impl WitnessProvider for LedgerReader {
+            fn call_witness(
+                &self,
+                ctx: &mut WitnessContext<'_>,
+                _name: &str,
+                _args: &[Value],
+            ) -> Result<WitnessOutcome, InterpreterError> {
+                let ledger = ctx.ledger().expect("the interpreter passes the ledger");
+                Ok(WitnessOutcome::Value(Value::Integer(u128::from(
+                    counter_cell(ledger),
+                ))))
+            }
+        }
+
+        let witnesses = vec![ir::Witness {
+            name: ident("%round.3"),
+            arguments: Vec::new(),
+            result_type: uint("18446744073709551615"),
+        }];
+        let program = Program::new(&[], &witnesses, &[]);
+        let circ = circuit(
+            Vec::new(),
+            uint("18446744073709551615"),
+            ir::Expr::Call {
+                name: ident("%round.3"),
+                args: Vec::new(),
+            },
+        );
+        let result = execute(
+            &circ,
+            &program,
+            make_counter_state(41),
+            &[],
+            Env {
+                witnesses: &LedgerReader,
+                ..epoch()
+            },
+        )
+        .expect("the witness runs");
+        assert!(equal_at(
+            &uint("18446744073709551615"),
+            &result.result,
+            &Value::Integer(41)
+        ));
     }
 
     /// An alias is transparent to every value-level operation, so a field read

@@ -2,7 +2,8 @@ use midnight_base_crypto::fab::{AlignedValue, InvalidBuiltinDecode, ValueSlice};
 use midnight_onchain_state::state::StateValue;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap;
-use midnight_transient_crypto::merkle_tree::{MerkleTree, MerkleTreeDigest};
+use midnight_transient_crypto::fab::ValueReprAlignedValue;
+use midnight_transient_crypto::merkle_tree::{MerklePath, MerkleTree, MerkleTreeDigest};
 use std::marker::PhantomData;
 
 use crate::StateError;
@@ -295,5 +296,17 @@ impl<'a> MerkleTreeAccessor<'a> {
     /// Returns the root hash of the merkle tree, if the tree has been rehashed.
     pub fn root(&self) -> Option<MerkleTreeDigest> {
         self.tree.root()
+    }
+
+    /// The path from `leaf` to the root, for the first slot holding `leaf`, or `None` when no
+    /// slot holds it. `leaf` is the value as the circuit inserted it; its hash is the one the
+    /// circuit's `insert` stored, so the path's root is what the circuit's `merkleTreePathRoot`
+    /// computes. This is the TypeScript runtime's `findPathForLeaf`.
+    pub fn find_path_for_leaf(
+        &self,
+        leaf: &AlignedValue,
+    ) -> Option<MerklePath<ValueReprAlignedValue>> {
+        self.tree
+            .find_path_for_leaf(ValueReprAlignedValue(leaf.clone()))
     }
 }
