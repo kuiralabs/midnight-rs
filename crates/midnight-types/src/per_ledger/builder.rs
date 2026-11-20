@@ -436,7 +436,6 @@ impl<'a> TransferBuilder<'a> {
                 give_amount,
                 receive_token,
                 receive_amount,
-                held_until,
             } => {
                 builder
                     .prepare_shielded_swap_offer(
@@ -444,7 +443,6 @@ impl<'a> TransferBuilder<'a> {
                         give_amount,
                         receive_token.into_ledger(),
                         receive_amount,
-                        held_until,
                     )
                     .await
             }
@@ -573,8 +571,10 @@ impl<'a> TransferBuilder<'a> {
     /// It is the half [`Self::prepare_shielded_swap`] builds, with two
     /// differences an offer needs. It spends one coin worth exactly what it
     /// gives, so it makes no change and holds no more than it gives until a
-    /// taker finds it. And its coin stays reserved until `held_until` rather
-    /// than for the chain's `global_ttl`, which a half with no intent gets.
+    /// taker finds it. And its coin stays reserved with no TTL, rather than for
+    /// the chain's `global_ttl` that a half with no intent gets, because an
+    /// offer can be taken until its coin is spent: the reservation goes once a
+    /// sync sees a taker's swap or the maker's cancel spend it.
     ///
     /// # Errors
     ///
@@ -588,7 +588,6 @@ impl<'a> TransferBuilder<'a> {
         give_amount: u128,
         receive_token: ShieldedTokenType,
         receive_amount: u128,
-        held_until: Timestamp,
     ) -> Result<PreparedTransfer, WalletError> {
         let seed = self.state.seed().into_ledger();
         let (coin, held) = self.context.with_wallet_from_seed(seed.clone(), |wallet| {
@@ -632,7 +631,7 @@ impl<'a> TransferBuilder<'a> {
         let mut prepared = self
             .offer_from_coins(give_token, vec![coin], 0, Box::new(payment), false)
             .await?;
-        prepared.expires_at = held_until;
+        prepared.expires_at = Timestamp::MAX;
         Ok(prepared)
     }
 

@@ -599,10 +599,12 @@ impl MidnightProvider {
     /// to this wallet, fee-less, for a taker to complete and fund.
     ///
     /// The offer spends one coin worth exactly `give_amount`, so it makes no
-    /// change. The build reserves that coin until the chain time `held_until`,
-    /// the maker's expiry, so later builds in this wallet do not spend it and
-    /// cancel the offer unawares; it is not submitted, and nothing releases
-    /// it. The result's `tx_bytes` are the offer for the taker.
+    /// change. The build reserves that coin until a sync sees it spent, by a
+    /// taker's swap or by [`Self::cancel_swap_offer`], so later builds in this
+    /// wallet do not spend it and cancel the offer unawares. An offer's own
+    /// expiry is the maker's word, not the chain's: a taker can complete an
+    /// expired offer while its coin is unspent. It is not submitted, and
+    /// nothing else releases it. The result's `tx_bytes` are the offer for the taker.
     ///
     /// # Errors
     ///
@@ -616,14 +618,12 @@ impl MidnightProvider {
         give_amount: u128,
         want_token: ShieldedTokenType,
         want_amount: u128,
-        held_until: crate::Timestamp,
     ) -> Result<TransferResult, ProviderError> {
         let request = TransferRequest::new(midnight_types::TransferKind::ShieldedSwapOffer {
             give_token,
             give_amount,
             receive_token: want_token,
             receive_amount: want_amount,
-            held_until,
         });
         self.build_then_prove(request).await
     }

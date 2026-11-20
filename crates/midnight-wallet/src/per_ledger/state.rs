@@ -754,6 +754,10 @@ impl Wallet {
         state
             .pending
             .clear_confirmed(&spent_unshielded, &dust_nullifiers);
+        let coins = &state.zswap_state.coins;
+        state
+            .pending
+            .clear_unheld_shielded(|n| coins.contains_key(n));
 
         // Any pending entry whose TTL has passed against the chain's current
         // view can no longer produce a valid transaction; drop them so they
@@ -784,9 +788,8 @@ impl Wallet {
     /// - or the chain time passes `expires_at` (evicted at
     ///   [`Wallet::build_context_inner`] time).
     ///
-    /// `shielded_spends` (Zswap coin nullifiers pinned by a contract call) are
-    /// cleared by TTL only: once the spend confirms, resync drops the coin from
-    /// `zswap_state`, so filtering it out becomes a no-op regardless.
+    /// `shielded_spends` (Zswap coin nullifiers) are cleared once a sync no
+    /// longer finds the coin in `zswap_state`, or by TTL.
     ///
     /// `reserved_at` should be the block time of the build context (typically
     /// [`PreparedTransfer::reserved_at`](super::types::PreparedTransfer::reserved_at)),
@@ -1297,9 +1300,14 @@ impl Wallet {
         // Reservations whose spends this replay just observed confirmed are
         // no longer in flight; drop them so the underlying UTXOs become
         // spendable again immediately instead of waiting for TTL eviction.
-        let pending_changed = self
+        let confirmed = self
             .pending
             .clear_confirmed(&spent_unshielded, &dust_nullifiers);
+        let coins = &self.zswap_state.coins;
+        let unheld = self
+            .pending
+            .clear_unheld_shielded(|n| coins.contains_key(n));
+        let pending_changed = confirmed || unheld;
 
         // Re-persist the committed state (moved cursors, refreshed
         // parameters, cleared pending set) so a crash before the next sync

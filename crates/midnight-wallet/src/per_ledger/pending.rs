@@ -13,8 +13,9 @@
 //!   calls [`PendingReservations::clear_confirmed`] at its commit point:
 //!   an unshielded reservation is removed when its exact key was spent, a
 //!   dust batch when any of its spend nullifiers was observed. Shielded
-//!   coins are deliberately absent: a confirmed spend drops the coin from
-//!   `zswap_state`, so its reservation is already inert.
+//!   coins go by [`PendingReservations::clear_unheld_shielded`] instead: a
+//!   confirmed spend drops the coin from `zswap_state`, and its reservation
+//!   with it.
 //! - **Release**: [`PendingReservations::release`], for a build known to be
 //!   dead.
 //! - **TTL eviction**: once the chain time passes an entry's `expires_at`,
@@ -223,6 +224,18 @@ impl PendingReservations {
                 .iter()
                 .any(|s| s.reserved_at == p.reserved_at && s.input == p.nullifier)
         });
+    }
+
+    /// Drop the shielded reservations of coins the wallet no longer holds,
+    /// those for which `held` is false: a spend of the coin was replayed, so
+    /// the reservation guards nothing. A swap offer's coin is reserved with no
+    /// TTL, and only this drops its entry once a taker or a cancel spends it.
+    ///
+    /// Returns true when it removed a reservation.
+    pub(crate) fn clear_unheld_shielded(&mut self, held: impl Fn(&Nullifier) -> bool) -> bool {
+        let before = self.shielded.len();
+        self.shielded.retain(|p| held(&p.nullifier));
+        self.shielded.len() != before
     }
 
     /// Evict the entries outside [`within_ttl`] at the chain time `now`, so a
@@ -644,6 +657,53 @@ mod tests {
 
     fn shielded_nf(n: u8) -> Nullifier {
         Nullifier(helpers::HashOutput([n; 32]))
+    }
+
+    #[test]
+    fn a_shielded_reservation_with_no_ttl_goes_once_its_coin_is_spent() {
+        let mut p = PendingReservations::default();
+        p.reserve(
+            Vec::new(),
+            Vec::new(),
+            vec![shielded_nf(1), shielded_nf(2)],
+            Timestamp::from_secs(100),
+            Timestamp::MAX,
+        );
+
+        p.evict_expired(Timestamp::from_secs(u64::MAX - 1));
+        assert_eq!(p.shielded_spends().count(), 2, "no chain time evicts it");
+
+        let changed = p.clear_unheld_shielded(|n| *n == shielded_nf(1));
+
+        assert!(changed);
+        let held: Vec<_> = p.shielded_spends().map(|s| s.nullifier).collect();
+        assert_eq!(
+            held,
+            vec![shielded_nf(1)],
+            "only the spent coin's reservation goes"
+        );
+        assert!(!p.clear_unheld_shielded(|_| true), "nothing more to drop");
+    }
+
+    #[test]
+    fn a_reservation_with_no_ttl_keeps_it_across_storage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut p = PendingReservations::default();
+        p.reserve(
+            Vec::new(),
+            Vec::new(),
+            vec![shielded_nf(3)],
+            Timestamp::from_secs(100),
+            Timestamp::MAX,
+        );
+        p.save(dir.path(), "undeployed", "testwallet").unwrap();
+
+        let loaded = PendingReservations::load(dir.path(), "undeployed", "testwallet")
+            .unwrap()
+            .expect("pending.json should load");
+
+        let expiries: Vec<_> = loaded.shielded_spends().map(|s| s.expires_at).collect();
+        assert_eq!(expiries, vec![Timestamp::MAX]);
     }
 
     #[test]

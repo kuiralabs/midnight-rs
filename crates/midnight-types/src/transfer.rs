@@ -175,8 +175,6 @@ pub enum TransferKind {
         give_amount: u128,
         receive_token: ShieldedTokenType,
         receive_amount: u128,
-        /// The chain time until which the build reserves the offer's coin.
-        held_until: Timestamp,
     },
     /// The cancel of this wallet's swap offer: a shielded transfer of the
     /// offer's coins back to this wallet, which pays its fee in Dust. See
