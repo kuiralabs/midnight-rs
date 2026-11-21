@@ -736,7 +736,10 @@ impl MidnightProvider {
     ) -> Result<TransferResult, ProviderError> {
         // Each arm is boxed so the caller's frame holds one future, not both
         // generations' (see the frame-size note on `resync_wallet`).
-        match self.builds().await? {
+        let started = std::time::Instant::now();
+        let builds = self.builds().await?;
+        tracing::info!(target: "kuira::timing", stage = "resync", ms = started.elapsed().as_millis() as u64);
+        match builds {
             Builds::Ledger8(builds) => Box::pin(builds.build_then_prove(request)).await,
             Builds::Ledger9(builds) => Box::pin(builds.build_then_prove(request)).await,
         }

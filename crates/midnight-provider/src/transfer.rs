@@ -445,5 +445,8 @@ async fn build_and_submit(
     request: TransferRequest,
 ) -> Result<PendingTx, ProviderError> {
     let result = provider.build_then_prove(request).await?;
-    provider.submit_reserved(result).await
+    let started = std::time::Instant::now();
+    let pending = provider.submit_reserved(result).await;
+    tracing::info!(target: "kuira::timing", stage = "submit", ms = started.elapsed().as_millis() as u64);
+    pending
 }

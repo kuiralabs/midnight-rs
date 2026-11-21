@@ -243,11 +243,16 @@ impl<'a> Builds<'a> {
         &self,
         request: TransferRequest,
     ) -> Result<TransferResult, ProviderError> {
+        let started = std::time::Instant::now();
         let reserved = self
             .wallet
             .prepare_transfer(request, self.prover.clone())
             .await?;
-        self.prove_reserved(reserved).await
+        tracing::info!(target: "kuira::timing", stage = "prepare", ms = started.elapsed().as_millis() as u64);
+        let started = std::time::Instant::now();
+        let proven = self.prove_reserved(reserved).await;
+        tracing::info!(target: "kuira::timing", stage = "prove", ms = started.elapsed().as_millis() as u64);
+        proven
     }
 
     /// Prove a build whose inputs the wallet already holds, with the wallet
